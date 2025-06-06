@@ -534,49 +534,45 @@ class Concert2StudioModel(nn.Module):
         return final_waveform
 
     def calculate_losses(self, pred, target):
-        """Calculate combined loss with strong stability improvements for small datasets"""
+        """Calculate combined loss optimized for tiny datasets with extreme stability"""
         losses = {}
 
-        # L1 loss (primary reconstruction loss)
-        l1_loss = self.l1_loss(pred, target)
-        losses["l1"] = torch.clamp(l1_loss, max=5.0)  # More conservative clamping
+        # Add noise to target for label smoothing (prevents overfitting)
+        if self.training:
+            noise_scale = 0.01  # Very small noise
+            target_smooth = target + torch.randn_like(target) * noise_scale
+        else:
+            target_smooth = target
+
+        # L1 loss (primary reconstruction loss) with label smoothing
+        l1_loss = self.l1_loss(pred, target_smooth)
+        losses["l1"] = torch.clamp(l1_loss, max=2.0)  # Even more conservative
 
         # Add channel dimension for auraloss (expects 3D: batch, channels, time)
         if pred.dim() == 2:
             pred_3d = pred.unsqueeze(1)
-            target_3d = target.unsqueeze(1)
+            target_3d = target_smooth.unsqueeze(1)
         else:
             pred_3d = pred
-            target_3d = target
+            target_3d = target_smooth
 
-        # Multi-resolution STFT loss with conservative weighting
+        # Multi-resolution STFT loss with very conservative weighting
         try:
             stft_loss = self.multires_stft_loss(pred_3d, target_3d)
-            losses["multires_stft"] = torch.clamp(stft_loss, max=20.0)
+            losses["multires_stft"] = torch.clamp(stft_loss, max=10.0)
         except Exception as e:
             print(f"STFT loss computation failed: {e}")
             losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-        # Simplified spectral loss instead of heavy VGGish
-        pred_spec = self.stft(pred)
-        target_spec = self.stft(target)
-
-        # Basic spectral magnitude loss
-        pred_mag = torch.abs(pred_spec)
-        target_mag = torch.abs(target_spec)
-        spectral_loss = F.l1_loss(pred_mag, target_mag)
-        losses["spectral"] = torch.clamp(spectral_loss, max=2.0)
-
-        # Conservative loss weighting to prevent training instability
-        # Heavily favor L1 loss for small datasets
+        # For tiny datasets, focus mainly on L1 reconstruction
+        # Minimize complex losses that can cause overfitting
         total_loss = (
-            0.7 * losses["l1"]  # Dominant L1 loss
-            + 0.2 * losses["multires_stft"]  # Reduced STFT weight
-            + 0.1 * losses["spectral"]  # Light spectral guidance
+            0.9 * losses["l1"]  # Heavily dominant L1 loss
+            + 0.1 * losses["multires_stft"]  # Minimal STFT guidance
         )
 
-        # Strict numerical stability check
-        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 100.0:
+        # Ultra-strict numerical stability check
+        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 50.0:
             print("Warning: Unstable loss detected, falling back to L1 only")
             total_loss = losses["l1"]
 
