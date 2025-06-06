@@ -416,13 +416,16 @@ class EnhancedUnivNetWrapper(nn.Module):
 
     def forward(self, waveform):
         # Handle different input formats
-        if waveform.dim() == 2:
+        if waveform.dim() == 2:  # Mono: (B, T)
             if self.use_stereo:
                 # For stereo, input should be (B, T) and we'll convert to (B, 2, T)
                 x = waveform.unsqueeze(1).repeat(1, 2, 1)
             else:
-                x = waveform.unsqueeze(1)
+                x = waveform.unsqueeze(1)  # (B, 1, T)
             squeeze_output = True
+        elif waveform.dim() == 3:  # Stereo: (B, 2, T)
+            x = waveform  # Already in correct format
+            squeeze_output = False
         else:
             x = waveform
             squeeze_output = False
@@ -604,27 +607,64 @@ class Concert2StudioModel(nn.Module):
         self._apply_spectral_norm()
 
     def forward(self, waveform, target_waveform=None):
-        # Convert to spectrogram
-        spec = self.stft(waveform)
-        magnitude = torch.abs(spec)
-        phase = torch.angle(spec)
+        # Handle stereo input: process each channel separately
+        if waveform.dim() == 3:  # Stereo: (B, 2, T)
+            batch_size, channels, time_samples = waveform.shape
 
-        # Reshape for U-Net: treat frequency bins as channels
-        # (B, freq, time) -> (B, freq, 1, time)
-        magnitude_4d = magnitude.unsqueeze(2)  # (B, freq, 1, time)
+            # Process each channel separately
+            enhanced_channels = []
+            for ch in range(channels):
+                # Extract single channel: (B, T)
+                channel_waveform = waveform[:, ch, :]
 
-        # Enhance magnitude with U-Net
-        enhanced_magnitude_4d = self.unet(magnitude_4d)
+                # Convert to spectrogram
+                spec = self.stft(channel_waveform)
+                magnitude = torch.abs(spec)
+                phase = torch.angle(spec)
 
-        # Reshape back to original spectrogram shape
-        # (B, freq, 1, time) -> (B, freq, time)
-        enhanced_magnitude = enhanced_magnitude_4d.squeeze(2)
+                # Reshape for U-Net: treat frequency bins as channels
+                # (B, freq, time) -> (B, freq, 1, time)
+                magnitude_4d = magnitude.unsqueeze(2)
 
-        # Reconstruct complex spectrogram
-        enhanced_spec = enhanced_magnitude * torch.exp(1j * phase)
+                # Enhance magnitude with U-Net
+                enhanced_magnitude_4d = self.unet(magnitude_4d)
 
-        # Convert back to waveform
-        enhanced_waveform = self.istft(enhanced_spec)
+                # Reshape back to original spectrogram shape
+                # (B, freq, 1, time) -> (B, freq, time)
+                enhanced_magnitude = enhanced_magnitude_4d.squeeze(2)
+
+                # Reconstruct complex spectrogram
+                enhanced_spec = enhanced_magnitude * torch.exp(1j * phase)
+
+                # Convert back to waveform
+                enhanced_channel = self.istft(enhanced_spec)
+                enhanced_channels.append(enhanced_channel)
+
+            # Combine channels: (B, 2, T)
+            enhanced_waveform = torch.stack(enhanced_channels, dim=1)
+
+        else:  # Mono: (B, T)
+            # Convert to spectrogram
+            spec = self.stft(waveform)
+            magnitude = torch.abs(spec)
+            phase = torch.angle(spec)
+
+            # Reshape for U-Net: treat frequency bins as channels
+            # (B, freq, time) -> (B, freq, 1, time)
+            magnitude_4d = magnitude.unsqueeze(2)
+
+            # Enhance magnitude with U-Net
+            enhanced_magnitude_4d = self.unet(magnitude_4d)
+
+            # Reshape back to original spectrogram shape
+            # (B, freq, 1, time) -> (B, freq, time)
+            enhanced_magnitude = enhanced_magnitude_4d.squeeze(2)
+
+            # Reconstruct complex spectrogram
+            enhanced_spec = enhanced_magnitude * torch.exp(1j * phase)
+
+            # Convert back to waveform
+            enhanced_waveform = self.istft(enhanced_spec)
 
         # Ensure output length matches input length
         if enhanced_waveform.shape[-1] != waveform.shape[-1]:
@@ -683,12 +723,14 @@ class Concert2StudioModel(nn.Module):
         losses["l1"] = torch.clamp(l1_loss, max=2.0)  # Even more conservative
 
         # Add channel dimension for auraloss (expects 3D: batch, channels, time)
-        if pred.dim() == 2:
+        if pred.dim() == 2:  # Mono: (B, T) -> (B, 1, T)
             pred_3d = pred.unsqueeze(1)
             target_3d = target_smooth.unsqueeze(1)
-        else:
+        elif pred.dim() == 3:  # Stereo: (B, 2, T) - already correct format
             pred_3d = pred
             target_3d = target_smooth
+        else:
+            raise ValueError(f"Unexpected prediction tensor shape: {pred.shape}")
 
         # Multi-resolution STFT loss with very conservative weighting
         try:
@@ -749,8 +791,14 @@ if __name__ == "__main__":
     # Test forward pass
     batch_size = 2
     seq_length = int(config["audio"]["sample_rate"] * config["audio"]["segment_length"])
-    dummy_input = torch.randn(batch_size, seq_length)
-    dummy_target = torch.randn(batch_size, seq_length)
+
+    # Test both mono and stereo based on config
+    if config["model"]["unet"].get("use_stereo", False):
+        dummy_input = torch.randn(batch_size, 2, seq_length)  # Stereo
+        dummy_target = torch.randn(batch_size, 2, seq_length)
+    else:
+        dummy_input = torch.randn(batch_size, seq_length)  # Mono
+        dummy_target = torch.randn(batch_size, seq_length)
 
     with torch.no_grad():
         output, losses = model(dummy_input, dummy_target)
