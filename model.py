@@ -430,8 +430,18 @@ class EnhancedUnivNetWrapper(nn.Module):
 
         # Multi-scale processing
         multi_scale_outputs = []
+        target_length = x.shape[-1]  # Use input length as target
+
         for block in self.multi_scale_blocks:
-            multi_scale_outputs.append(block(x))
+            output = block(x)
+            # Ensure all outputs have the same temporal dimension
+            if output.shape[-1] != target_length:
+                if output.shape[-1] > target_length:
+                    output = output[..., :target_length]
+                else:
+                    pad_length = target_length - output.shape[-1]
+                    output = F.pad(output, (0, pad_length))
+            multi_scale_outputs.append(output)
 
         # Fuse multi-scale features
         x = torch.cat(multi_scale_outputs, dim=1)
