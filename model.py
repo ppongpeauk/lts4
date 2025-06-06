@@ -141,19 +141,25 @@ class SpectroUNet(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize model weights to prevent vanishing outputs"""
+        """Initialize model weights to prevent vanishing/exploding gradients"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                # Use Xavier initialization for better gradient flow
+                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                # Use Xavier initialization for transpose convolutions too
+                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         # x shape: (B, C, H, W) where C is frequency bins
@@ -348,6 +354,26 @@ class MultiResSTFTLoss(nn.Module):
         return self.loss_fn(pred, target)
 
 
+class SpectralConvergenceLoss(nn.Module):
+    """Spectral convergence loss for training stability"""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_spec, target_spec):
+        """Calculate spectral convergence loss"""
+        # Ensure spectra are magnitude spectrograms
+        if torch.is_complex(pred_spec):
+            pred_spec = torch.abs(pred_spec)
+        if torch.is_complex(target_spec):
+            target_spec = torch.abs(target_spec)
+
+        # Spectral convergence
+        return torch.norm(target_spec - pred_spec, p="fro") / torch.norm(
+            target_spec, p="fro"
+        )
+
+
 class VGGishLoss(nn.Module):
     """VGGish perceptual loss for audio quality assessment"""
 
@@ -360,31 +386,47 @@ class VGGishLoss(nn.Module):
 
         self.vgg_net = nn.Sequential(
             nn.Conv2d(1, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
 
-        # Freeze VGG features
+        # Freeze VGG features after proper initialization
+        self._initialize_weights()
         for param in self.vgg_net.parameters():
             param.requires_grad = False
 
+    def _initialize_weights(self):
+        """Initialize VGG network weights properly"""
+        for m in self.vgg_net.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, pred, target):
-        # Convert to mel-spectrograms
-        pred_mel = self.mel_transform(pred).unsqueeze(1)
-        target_mel = self.mel_transform(target).unsqueeze(1)
+        # Convert to mel-spectrograms with proper clamping
+        pred_mel = self.mel_transform(pred).clamp(min=1e-7).log().unsqueeze(1)
+        target_mel = self.mel_transform(target).clamp(min=1e-7).log().unsqueeze(1)
 
         # Extract features
         pred_features = self.vgg_net(pred_mel)
         target_features = self.vgg_net(target_mel)
 
-        # L2 loss between features
-        return F.mse_loss(pred_features, target_features)
+        # L2 loss between features with gradient scaling
+        loss = F.mse_loss(pred_features, target_features)
+        return loss * 0.1  # Scale down perceptual loss to prevent dominance
 
 
 class Concert2StudioModel(nn.Module):
@@ -433,6 +475,11 @@ class Concert2StudioModel(nn.Module):
             "multires_stft": config["loss"]["multires_stft_weight"],
             "vggish": config["loss"]["vggish_weight"],
         }
+
+        # Training stability improvements
+        self.spectral_convergence_loss = SpectralConvergenceLoss()
+        self.register_buffer("global_step", torch.tensor(0))
+        self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
 
     def forward(self, waveform, target_waveform=None):
         # Convert to spectrogram
@@ -497,11 +544,12 @@ class Concert2StudioModel(nn.Module):
         return final_waveform
 
     def calculate_losses(self, pred, target):
-        """Calculate combined loss"""
+        """Calculate combined loss with stability improvements"""
         losses = {}
 
-        # L1 loss
-        losses["l1"] = self.l1_loss(pred, target)
+        # L1 loss with gradient clipping protection
+        l1_loss = self.l1_loss(pred, target)
+        losses["l1"] = torch.clamp(l1_loss, max=10.0)  # Prevent L1 explosion
 
         # Add channel dimension for auraloss (expects 3D: batch, channels, time)
         if pred.dim() == 2:
@@ -511,18 +559,54 @@ class Concert2StudioModel(nn.Module):
             pred_3d = pred
             target_3d = target
 
-        # Multi-resolution STFT loss
-        losses["multires_stft"] = self.multires_stft_loss(pred_3d, target_3d)
+        # Multi-resolution STFT loss with stability check
+        try:
+            stft_loss = self.multires_stft_loss(pred_3d, target_3d)
+            losses["multires_stft"] = torch.clamp(stft_loss, max=50.0)
+        except Exception as e:
+            print(f"STFT loss computation failed: {e}")
+            losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-        # VGGish perceptual loss
-        losses["vggish"] = self.vggish_loss(pred, target)
+        # VGGish perceptual loss with error handling
+        try:
+            vggish_loss = self.vggish_loss(pred, target)
+            losses["vggish"] = torch.clamp(vggish_loss, max=5.0)
+        except Exception as e:
+            print(f"VGGish loss computation failed: {e}")
+            losses["vggish"] = torch.tensor(0.0, device=pred.device)
 
-        # Combined loss
-        total_loss = (
-            self.loss_weights["l1"] * losses["l1"]
-            + self.loss_weights["multires_stft"] * losses["multires_stft"]
-            + self.loss_weights["vggish"] * losses["vggish"]
+        # Spectral convergence loss for stability
+        pred_spec = self.stft(pred)
+        target_spec = self.stft(target)
+        losses["spectral_convergence"] = self.spectral_convergence_loss(
+            pred_spec, target_spec
         )
+
+        # Adaptive loss weighting based on training progress
+        self.global_step += 1
+        progress = min(
+            self.global_step.float() / 10000.0, 1.0
+        )  # Warm up over 10k steps
+
+        # Start with reconstruction losses, gradually add perceptual losses
+        l1_weight = self.loss_weights["l1"]
+        stft_weight = self.loss_weights["multires_stft"] * progress
+        vggish_weight = self.loss_weights["vggish"] * (
+            progress**2
+        )  # Add perceptual loss slower
+
+        # Combined loss with balanced weighting
+        total_loss = (
+            l1_weight * losses["l1"]
+            + stft_weight * losses["multires_stft"]
+            + vggish_weight * losses["vggish"]
+            + 0.1 * losses["spectral_convergence"]  # Stability term
+        )
+
+        # Numerical stability check
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print("Warning: NaN/Inf detected in loss computation, using L1 loss only")
+            total_loss = losses["l1"]
 
         losses["total"] = total_loss
         return losses
