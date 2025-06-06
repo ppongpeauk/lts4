@@ -564,11 +564,35 @@ class Concert2StudioModel(nn.Module):
             print(f"STFT loss computation failed: {e}")
             losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-        # For tiny datasets, focus mainly on L1 reconstruction
-        # Minimize complex losses that can cause overfitting
+        # Add spectral coherence loss for better noise reduction
+        try:
+            pred_spec = self.stft(pred)
+            target_spec = self.stft(target_smooth)
+
+            # Magnitude loss for spectral clarity
+            pred_mag = torch.abs(pred_spec)
+            target_mag = torch.abs(target_spec)
+            spectral_loss = F.l1_loss(pred_mag, target_mag)
+            losses["spectral"] = torch.clamp(spectral_loss, max=3.0)
+
+            # Phase coherence loss for naturalness
+            pred_phase = torch.angle(pred_spec)
+            target_phase = torch.angle(target_spec)
+            phase_diff = torch.abs(torch.sin(pred_phase - target_phase))
+            phase_loss = torch.mean(phase_diff)
+            losses["phase"] = torch.clamp(phase_loss, max=1.0)
+
+        except Exception as e:
+            print(f"Spectral loss computation failed: {e}")
+            losses["spectral"] = torch.tensor(0.0, device=pred.device)
+            losses["phase"] = torch.tensor(0.0, device=pred.device)
+
+        # Balanced loss for noise reduction while maintaining reconstruction
         total_loss = (
-            0.9 * losses["l1"]  # Heavily dominant L1 loss
-            + 0.1 * losses["multires_stft"]  # Minimal STFT guidance
+            0.6 * losses["l1"]  # Primary reconstruction loss
+            + 0.2 * losses["multires_stft"]  # Spectral structure
+            + 0.15 * losses["spectral"]  # Magnitude clarity
+            + 0.05 * losses["phase"]  # Phase coherence
         )
 
         # Ultra-strict numerical stability check
