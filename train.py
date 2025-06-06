@@ -1,6 +1,7 @@
 """
 Training script for Concert2Studio
 Implements training loop with Accelerate, checkpointing, and logging
+Includes advanced adaptive gradient clipping and stability monitoring
 """
 
 import argparse
@@ -26,6 +27,69 @@ from accelerate.utils import set_seed
 # Local imports
 from model import Concert2StudioModel, count_parameters
 from dataset import create_dataloaders, verify_dataset
+
+# Handle MPS GPU issues on Apple Silicon
+if torch.backends.mps.is_available():
+    print("⚠️  MPS detected but disabled due to GPU errors. Using CPU for stability.")
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    # Force CPU usage to avoid MPS errors
+    torch.set_default_device("cpu")
+
+
+class AdaptiveGradientClipper:
+    """Adaptive gradient clipping based on gradient percentiles"""
+
+    def __init__(self, percentile: float = 95.0, decay: float = 0.99):
+        self.percentile = percentile
+        self.decay = decay
+        self.grad_norm_history = []
+        self.adaptive_threshold = None
+
+    def clip_gradients(self, model):
+        """Apply adaptive gradient clipping"""
+        # Calculate current gradient norm
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1.0 / 2)
+
+        # Update history
+        self.grad_norm_history.append(total_norm)
+
+        # Keep only recent history (last 1000 steps)
+        if len(self.grad_norm_history) > 1000:
+            self.grad_norm_history = self.grad_norm_history[-1000:]
+
+        # Calculate adaptive threshold
+        if len(self.grad_norm_history) >= 10:
+            # Use percentile-based threshold
+            threshold = torch.quantile(
+                torch.tensor(self.grad_norm_history), self.percentile / 100.0
+            )
+
+            # Smooth the threshold
+            if self.adaptive_threshold is None:
+                self.adaptive_threshold = threshold.item()
+            else:
+                self.adaptive_threshold = (
+                    self.decay * self.adaptive_threshold
+                    + (1 - self.decay) * threshold.item()
+                )
+        else:
+            # Use conservative default
+            self.adaptive_threshold = 1.0
+
+        # Apply clipping if needed
+        if total_norm > self.adaptive_threshold:
+            clip_coef = self.adaptive_threshold / (total_norm + 1e-8)
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.data.mul_(clip_coef)
+            return True, total_norm, self.adaptive_threshold
+
+        return False, total_norm, self.adaptive_threshold
 
 
 class EarlyStopping:
@@ -61,8 +125,72 @@ class EarlyStopping:
         return self.early_stop
 
 
+class StabilityMonitor:
+    """Monitor training stability and detect issues"""
+
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+        self.loss_history = []
+        self.grad_norm_history = []
+
+    def update(self, loss_value: float, grad_norm: float):
+        """Update monitoring history"""
+        self.loss_history.append(loss_value)
+        self.grad_norm_history.append(grad_norm)
+
+        # Keep only recent history
+        if len(self.loss_history) > self.window_size:
+            self.loss_history = self.loss_history[-self.window_size :]
+        if len(self.grad_norm_history) > self.window_size:
+            self.grad_norm_history = self.grad_norm_history[-self.window_size :]
+
+    def detect_instability(self) -> bool:
+        """Detect training instability"""
+        if len(self.loss_history) < 10:
+            return False
+
+        recent_losses = self.loss_history[-10:]
+
+        # Check for NaN/Inf
+        if any(math.isnan(loss) or math.isinf(loss) for loss in recent_losses):
+            return True
+
+        # Check for explosive growth
+        if len(recent_losses) >= 5:
+            recent_avg = sum(recent_losses[-5:]) / 5
+            older_avg = sum(recent_losses[-10:-5]) / 5
+            if recent_avg > older_avg * 10:  # 10x increase
+                return True
+
+        return False
+
+    def get_stability_metrics(self) -> dict:
+        """Get current stability metrics"""
+        if not self.loss_history:
+            return {}
+
+        return {
+            "loss_std": (
+                torch.std(torch.tensor(self.loss_history[-20:])).item()
+                if len(self.loss_history) >= 20
+                else 0
+            ),
+            "grad_norm_std": (
+                torch.std(torch.tensor(self.grad_norm_history[-20:])).item()
+                if len(self.grad_norm_history) >= 20
+                else 0
+            ),
+            "avg_loss": sum(self.loss_history[-10:]) / min(10, len(self.loss_history)),
+            "avg_grad_norm": (
+                sum(self.grad_norm_history[-10:]) / min(10, len(self.grad_norm_history))
+                if self.grad_norm_history
+                else 0
+            ),
+        }
+
+
 class Trainer:
-    """Main trainer class"""
+    """Main trainer class with advanced stability features"""
 
     def __init__(self, config: dict, accelerator: Accelerator):
         self.config = config
@@ -93,6 +221,7 @@ class Trainer:
                 float(config["training"]["beta2"]),
             ),
             weight_decay=float(config["training"]["weight_decay"]),
+            eps=1e-8,  # Improved numerical stability
         )
 
         # Create learning rate scheduler
@@ -103,11 +232,25 @@ class Trainer:
             patience=int(config["training"]["early_stopping_patience"]), mode="min"
         )
 
+        # Initialize adaptive gradient clipping
+        self.adaptive_clipper = AdaptiveGradientClipper(
+            percentile=95.0, decay=0.99  # Clip top 5% of gradients
+        )
+
+        # Initialize stability monitoring
+        self.stability_monitor = StabilityMonitor(window_size=100)
+
         # Training state
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.last_checkpoint_time = time.time()
+
+        # Conservative training mode
+        self.conservative_mode = config["training"].get("conservative_mode", True)
+        self.stability_check_interval = config["training"].get(
+            "stability_check_interval", 100
+        )
 
         # Compile model if requested
         if config["hardware"]["compile_model"]:
@@ -118,9 +261,6 @@ class Trainer:
             except Exception as e:
                 if self.accelerator.is_main_process:
                     print(f"⚠️  torch.compile failed: {e}")
-
-        # Note: channels_last memory format is not applicable to audio models
-        # Audio models work with 2D/3D tensors, not 4D image tensors
 
     def create_directories(self):
         """Create necessary directories"""
@@ -201,21 +341,19 @@ class Trainer:
             "config": self.config,
         }
 
-        # Save latest checkpoint
-        latest_path = checkpoint_dir / "latest.pt"
-        torch.save(checkpoint, latest_path)
+        # Save current checkpoint
+        checkpoint_path = (
+            checkpoint_dir / f"checkpoint_epoch_{self.current_epoch:03d}.pt"
+        )
+        torch.save(checkpoint, checkpoint_path)
 
-        # Save best checkpoint
+        # Save best model
         if is_best:
-            best_path = checkpoint_dir / "best.pt"
+            best_path = checkpoint_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"💾 Saved best checkpoint (val_loss: {self.best_val_loss:.6f})")
+            print(f"💎 New best model saved: {self.best_val_loss:.6f}")
 
-        # Save epoch checkpoint
-        epoch_path = checkpoint_dir / f"epoch_{self.current_epoch:03d}.pt"
-        torch.save(checkpoint, epoch_path)
-
-        # Clean up old checkpoints
+        # Cleanup old checkpoints
         self.cleanup_checkpoints()
 
     def cleanup_checkpoints(self):
@@ -223,45 +361,80 @@ class Trainer:
         checkpoint_dir = Path(self.config["paths"]["checkpoint_dir"])
         max_checkpoints = self.config["checkpoint"]["max_checkpoints"]
 
-        # Get all epoch checkpoints
-        epoch_checkpoints = sorted(
-            checkpoint_dir.glob("epoch_*.pt"),
+        # Get all checkpoint files
+        checkpoints = sorted(
+            checkpoint_dir.glob("checkpoint_epoch_*.pt"),
             key=lambda x: x.stat().st_mtime,
-            reverse=True,
         )
 
         # Remove old checkpoints
-        for checkpoint in epoch_checkpoints[max_checkpoints:]:
-            checkpoint.unlink()
+        if len(checkpoints) > max_checkpoints:
+            for old_checkpoint in checkpoints[:-max_checkpoints]:
+                old_checkpoint.unlink()
 
     def should_save_checkpoint(self):
         """Check if we should save a checkpoint"""
-        time_threshold = self.config["checkpoint"]["save_interval_minutes"] * 60
-        step_threshold = self.config["checkpoint"]["save_interval_steps"]
+        save_interval_minutes = self.config["checkpoint"]["save_interval_minutes"]
+        save_interval_steps = self.config["checkpoint"]["save_interval_steps"]
 
-        time_elapsed = time.time() - self.last_checkpoint_time
-
-        return time_elapsed >= time_threshold or self.global_step % step_threshold == 0
+        time_elapsed = (time.time() - self.last_checkpoint_time) / 60
+        return (
+            time_elapsed >= save_interval_minutes
+            or self.global_step % save_interval_steps == 0
+        )
 
     def train_step(self, batch):
-        """Single training step"""
+        """Single training step with stability monitoring"""
         concert_audio, studio_audio = batch
-
-        # Note: channels_last is not applicable to audio tensors (2D/3D)
-        # Audio tensors don't benefit from channels_last memory format
 
         # Forward pass
         with self.accelerator.autocast():
             enhanced_audio, losses = self.model(concert_audio, studio_audio)
             total_loss = losses["total"]
 
+        # Check for numerical issues
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"⚠️  Numerical instability detected at step {self.global_step}")
+            print(f"Loss components: {[(k, v.item()) for k, v in losses.items()]}")
+
+            # Skip this step to prevent corruption
+            self.optimizer.zero_grad()
+            return {"total": torch.tensor(0.0, device=total_loss.device)}
+
         # Backward pass
         self.accelerator.backward(total_loss)
 
-        # Gradient clipping
+        # Adaptive gradient clipping
         if self.accelerator.sync_gradients:
-            max_norm = float(self.config["training"]["max_grad_norm"])
-            self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
+            # Get raw model for gradient operations
+            raw_model = self.accelerator.unwrap_model(self.model)
+
+            # Apply adaptive gradient clipping
+            clipped, grad_norm, threshold = self.adaptive_clipper.clip_gradients(
+                raw_model
+            )
+
+            # Update stability monitor
+            self.stability_monitor.update(total_loss.item(), grad_norm)
+
+            # Check for instability
+            if (
+                self.conservative_mode
+                and self.global_step % self.stability_check_interval == 0
+            ):
+                if self.stability_monitor.detect_instability():
+                    print(
+                        f"⚠️  Training instability detected at step {self.global_step}"
+                    )
+                    stability_metrics = self.stability_monitor.get_stability_metrics()
+                    print(f"Stability metrics: {stability_metrics}")
+
+                    # Reduce learning rate temporarily
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] *= 0.5
+                    print(
+                        f"Reduced learning rate to {self.optimizer.param_groups[0]['lr']:.2e}"
+                    )
 
         # Optimizer step
         self.optimizer.step()
@@ -283,19 +456,27 @@ class Trainer:
             ):
                 concert_audio, studio_audio = batch
 
-                # Note: channels_last is not applicable to audio tensors (2D/3D)
-                # Audio tensors don't benefit from channels_last memory format
-
                 with self.accelerator.autocast():
                     enhanced_audio, losses = self.model(concert_audio, studio_audio)
 
+                # Check for numerical issues in validation
+                if torch.isnan(losses["total"]) or torch.isinf(losses["total"]):
+                    print(f"⚠️  Numerical issue in validation, skipping batch")
+                    continue
+
                 val_losses.append(losses["total"].item())
 
-        avg_val_loss = sum(val_losses) / len(val_losses)
+        # Calculate average, handling empty list
+        if val_losses:
+            avg_val_loss = sum(val_losses) / len(val_losses)
+        else:
+            avg_val_loss = float("inf")
+            print("⚠️  All validation batches had numerical issues")
+
         return avg_val_loss
 
     def train(self, train_loader, val_loader):
-        """Main training loop"""
+        """Main training loop with enhanced stability monitoring"""
 
         # Prepare everything with accelerator
         self.model, self.optimizer, train_loader, val_loader, self.scheduler = (
@@ -326,13 +507,15 @@ class Trainer:
                         print(f"🔒 Freezing vocoder for first {freeze_epochs} epochs")
                     # Access the actual model through accelerator wrapper
                     actual_model = self.accelerator.unwrap_model(self.model)
-                    actual_model.vocoder.freeze_parameters()
+                    if hasattr(actual_model, "vocoder"):
+                        actual_model.vocoder.freeze_parameters()
                 elif epoch == freeze_epochs:
                     if self.accelerator.is_main_process:
                         print(f"🔓 Unfreezing vocoder at epoch {epoch+1}")
                     # Access the actual model through accelerator wrapper
                     actual_model = self.accelerator.unwrap_model(self.model)
-                    actual_model.vocoder.unfreeze_parameters()
+                    if hasattr(actual_model, "vocoder"):
+                        actual_model.vocoder.unfreeze_parameters()
 
             # Training phase
             self.model.train()
@@ -346,15 +529,22 @@ class Trainer:
 
             for batch in progress_bar:
                 losses = self.train_step(batch)
-                epoch_losses.append(losses["total"].item())
+
+                # Only append valid losses
+                if not (torch.isnan(losses["total"]) or torch.isinf(losses["total"])):
+                    epoch_losses.append(losses["total"].item())
+
                 self.global_step += 1
 
-                # Update progress bar
+                # Update progress bar with stability info
                 if self.accelerator.is_main_process and self.global_step % 10 == 0:
+                    stability_metrics = self.stability_monitor.get_stability_metrics()
                     progress_bar.set_postfix(
                         {
                             "loss": f"{losses['total'].item():.6f}",
                             "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                            "grad_norm": f"{stability_metrics.get('avg_grad_norm', 0):.4f}",
+                            "loss_std": f"{stability_metrics.get('loss_std', 0):.4f}",
                         }
                     )
 
@@ -365,11 +555,24 @@ class Trainer:
 
             # Validation phase
             if self.accelerator.is_main_process:
-                avg_train_loss = sum(epoch_losses) / len(epoch_losses)
+                # Calculate average training loss, handling empty list
+                if epoch_losses:
+                    avg_train_loss = sum(epoch_losses) / len(epoch_losses)
+                else:
+                    avg_train_loss = float("inf")
+                    print("⚠️  All training batches had numerical issues")
+
                 avg_val_loss = self.validate(val_loader)
 
                 print(
                     f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+                )
+
+                # Print stability metrics
+                stability_metrics = self.stability_monitor.get_stability_metrics()
+                print(
+                    f"Stability: Loss std: {stability_metrics.get('loss_std', 0):.4f}, "
+                    f"Grad norm: {stability_metrics.get('avg_grad_norm', 0):.4f}"
                 )
 
                 # Check for best model
@@ -493,9 +696,6 @@ def main():
             import traceback
 
             traceback.print_exc()
-    finally:
-        # Cleanup
-        accelerator.end_training()
 
 
 if __name__ == "__main__":

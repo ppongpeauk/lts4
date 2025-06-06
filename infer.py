@@ -1,6 +1,7 @@
 """
 Inference script for Concert2Studio
 CLI tool for processing concert recordings to studio quality
+Includes improved stability and overlap-add processing
 """
 
 import argparse
@@ -21,7 +22,7 @@ from model import Concert2StudioModel, count_parameters
 
 
 class AudioInferencer:
-    """Audio inference with overlap-add processing"""
+    """Audio inference with enhanced overlap-add processing and stability"""
 
     def __init__(self, config: dict, checkpoint_path: str, device: str = "auto"):
         self.config = config
@@ -39,8 +40,8 @@ class AudioInferencer:
         self.segment_length = config["audio"]["segment_length"]
         self.segment_samples = int(self.sample_rate * self.segment_length)
 
-        # Overlap parameters for smoother results
-        self.overlap_ratio = 0.25  # 25% overlap
+        # Improved overlap parameters for better reconstruction
+        self.overlap_ratio = 0.5  # 50% overlap for better stability
         self.overlap_samples = int(self.segment_samples * self.overlap_ratio)
         self.hop_samples = self.segment_samples - self.overlap_samples
 
@@ -75,13 +76,10 @@ class AudioInferencer:
             except Exception as e:
                 print(f"⚠️  torch.compile failed: {e}")
 
-        if self.config.get("hardware", {}).get("channels_last", False):
-            model = model.to(memory_format=torch.channels_last)
-
         return model
 
     def _load_audio(self, file_path: str) -> torch.Tensor:
-        """Load and preprocess audio file"""
+        """Load and preprocess audio file with improved error handling"""
         print(f"📂 Loading audio from {file_path}")
 
         try:
@@ -131,13 +129,18 @@ class AudioInferencer:
                 else:
                     waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
 
-            # Normalize
-            if torch.max(torch.abs(waveform)) > 1.0:
-                waveform = waveform / torch.max(torch.abs(waveform))
-                print("🔄 Normalized audio levels")
+            # Normalize with improved stability
+            max_val = torch.max(torch.abs(waveform))
+            if max_val > 1.0:
+                waveform = waveform / (max_val * 1.1)  # Add small headroom
+                print("🔄 Normalized audio levels with headroom")
+            elif max_val < 0.1:
+                # Boost very quiet audio
+                waveform = waveform / (max_val * 0.5)
+                print("🔄 Boosted quiet audio levels")
 
             print(
-                f"✅ Audio loaded: {len(waveform)} samples ({len(waveform)/self.sample_rate:.2f}s)"
+                f"✅ Audio loaded: {waveform.shape} samples ({waveform.shape[-1]/self.sample_rate:.2f}s)"
             )
             return waveform
 
@@ -145,7 +148,7 @@ class AudioInferencer:
             raise RuntimeError(f"Failed to load audio: {e}")
 
     def _apply_window(self, segment: torch.Tensor) -> torch.Tensor:
-        """Apply Hann window to segment edges for smooth overlap-add"""
+        """Apply improved Hann window to segment edges for smooth overlap-add"""
         use_stereo = self.config["model"]["unet"].get("use_stereo", False)
 
         if use_stereo:
@@ -153,44 +156,44 @@ class AudioInferencer:
             if segment.shape[-1] != self.segment_samples:
                 return segment
 
-            # Create Hann window for overlap regions
+            # Create improved Hann window for overlap regions
             window = torch.ones_like(segment)
 
-            # Fade in
-            fade_in = torch.hann_window(2 * self.overlap_samples)[
-                : self.overlap_samples
+            # Smooth fade in/out over overlap regions
+            fade_samples = self.overlap_samples
+            fade_in = torch.hann_window(2 * fade_samples, device=segment.device)[
+                :fade_samples
             ]
-            window[:, : self.overlap_samples] = fade_in.unsqueeze(0)
+            fade_out = torch.hann_window(2 * fade_samples, device=segment.device)[
+                fade_samples:
+            ]
 
-            # Fade out
-            fade_out = torch.hann_window(2 * self.overlap_samples)[
-                self.overlap_samples :
-            ]
-            window[:, -self.overlap_samples :] = fade_out.unsqueeze(0)
+            window[:, :fade_samples] = fade_in.unsqueeze(0)
+            window[:, -fade_samples:] = fade_out.unsqueeze(0)
         else:
             # Mono: segment shape is (T,)
             if len(segment) != self.segment_samples:
                 return segment
 
-            # Create Hann window for overlap regions
+            # Create improved Hann window for overlap regions
             window = torch.ones_like(segment)
 
-            # Fade in
-            fade_in = torch.hann_window(2 * self.overlap_samples)[
-                : self.overlap_samples
+            # Smooth fade in/out over overlap regions
+            fade_samples = self.overlap_samples
+            fade_in = torch.hann_window(2 * fade_samples, device=segment.device)[
+                :fade_samples
             ]
-            window[: self.overlap_samples] = fade_in
+            fade_out = torch.hann_window(2 * fade_samples, device=segment.device)[
+                fade_samples:
+            ]
 
-            # Fade out
-            fade_out = torch.hann_window(2 * self.overlap_samples)[
-                self.overlap_samples :
-            ]
-            window[-self.overlap_samples :] = fade_out
+            window[:fade_samples] = fade_in
+            window[-fade_samples:] = fade_out
 
         return segment * window
 
     def _process_segment(self, segment: torch.Tensor) -> torch.Tensor:
-        """Process a single audio segment"""
+        """Process a single audio segment with improved error handling"""
         use_stereo = self.config["model"]["unet"].get("use_stereo", False)
 
         if use_stereo:
@@ -201,7 +204,7 @@ class AudioInferencer:
                 segment = torch.nn.functional.pad(segment, (0, padding))
 
             # Add batch dimension: (2, T) -> (1, 2, T)
-            segment = segment.unsqueeze(0).to(self.device)
+            segment_batch = segment.unsqueeze(0).to(self.device)
         else:
             # Mono processing: segment shape is (T,)
             original_length = len(segment)
@@ -210,244 +213,308 @@ class AudioInferencer:
                 segment = torch.nn.functional.pad(segment, (0, padding))
 
             # Add batch dimension: (T,) -> (1, T)
-            segment = segment.unsqueeze(0).to(self.device)
-
-        # Set memory format if requested
-        if self.config.get("hardware", {}).get("channels_last", False):
-            segment = segment.to(memory_format=torch.channels_last)
+            segment_batch = segment.unsqueeze(0).to(self.device)
 
         # Process with model
         with torch.no_grad():
-            enhanced = self.model(segment)
+            try:
+                enhanced_segment = self.model(segment_batch)
 
-        # Move back to CPU and remove batch dimension
-        enhanced = enhanced.cpu().squeeze(0)
+                # Check for numerical issues
+                if (
+                    torch.isnan(enhanced_segment).any()
+                    or torch.isinf(enhanced_segment).any()
+                ):
+                    print(
+                        "⚠️  Numerical issues detected in model output, using original segment"
+                    )
+                    enhanced_segment = segment_batch
 
-        # Trim to original length if padded
+                # Clamp to reasonable range
+                enhanced_segment = torch.clamp(enhanced_segment, -1.0, 1.0)
+
+            except Exception as e:
+                print(f"⚠️  Model processing failed: {e}, using original segment")
+                enhanced_segment = segment_batch
+
+        # Remove batch dimension and move to CPU
         if use_stereo:
-            # Stereo: enhanced shape is (2, T)
-            if original_length < self.segment_samples:
-                enhanced = enhanced[..., :original_length]
+            enhanced_segment = enhanced_segment.squeeze(0).cpu()  # (1, 2, T) -> (2, T)
         else:
-            # Mono: enhanced shape is (T,)
-            if original_length < self.segment_samples:
-                enhanced = enhanced[:original_length]
+            enhanced_segment = enhanced_segment.squeeze(0).cpu()  # (1, T) -> (T,)
 
-        return enhanced
+        # Trim to original length
+        if use_stereo:
+            enhanced_segment = enhanced_segment[..., :original_length]
+        else:
+            enhanced_segment = enhanced_segment[:original_length]
+
+        return enhanced_segment
 
     def process_audio(
         self, input_audio: torch.Tensor, show_progress: bool = True
     ) -> torch.Tensor:
-        """Process full audio with overlap-add"""
+        """Process audio with improved overlap-add reconstruction"""
         use_stereo = self.config["model"]["unet"].get("use_stereo", False)
 
         if use_stereo:
-            # Stereo processing: input_audio shape is (2, T)
-            total_samples = input_audio.shape[-1]
+            audio_length = input_audio.shape[-1]
+            num_channels = input_audio.shape[0]
         else:
-            # Mono processing: input_audio shape is (T,)
-            total_samples = len(input_audio)
+            audio_length = len(input_audio)
 
-        if total_samples <= self.segment_samples:
-            # Audio is short enough to process in one go
-            print("🎵 Processing in single segment")
-            return self._process_segment(input_audio)
+        # Calculate number of segments with overlap
+        if audio_length <= self.segment_samples:
+            # Single segment
+            windowed_segment = self._apply_window(input_audio)
+            return self._process_segment(windowed_segment)
 
-        # Calculate number of segments
-        num_segments = max(
-            1, (total_samples - self.segment_samples) // self.hop_samples + 1
-        )
-        print(f"🎵 Processing {num_segments} overlapping segments")
+        # Multiple segments with overlap
+        num_segments = (audio_length - self.segment_samples) // self.hop_samples + 1
+        if (audio_length - self.segment_samples) % self.hop_samples != 0:
+            num_segments += 1
 
-        # Initialize output
+        # Initialize output buffer
         if use_stereo:
-            output_audio = torch.zeros(2, total_samples)
-            overlap_counts = torch.zeros(2, total_samples)
+            output_audio = torch.zeros(
+                (num_channels, audio_length), dtype=input_audio.dtype
+            )
+            weight_buffer = torch.zeros(
+                (num_channels, audio_length), dtype=input_audio.dtype
+            )
         else:
-            output_audio = torch.zeros(total_samples)
-            overlap_counts = torch.zeros(total_samples)
+            output_audio = torch.zeros(audio_length, dtype=input_audio.dtype)
+            weight_buffer = torch.zeros(audio_length, dtype=input_audio.dtype)
 
-        # Process segments with overlap-add
-        for i in range(num_segments):
+        # Process segments with progress bar
+        iterator = range(num_segments)
+        if show_progress:
+            from tqdm import tqdm
+
+            iterator = tqdm(iterator, desc="Processing segments")
+
+        for i in iterator:
             start_idx = i * self.hop_samples
-            end_idx = min(start_idx + self.segment_samples, total_samples)
-
-            if show_progress:
-                progress = (i + 1) / num_segments * 100
-                print(
-                    f"\r🔄 Processing segment {i+1}/{num_segments} ({progress:.1f}%)",
-                    end="",
-                )
+            end_idx = min(start_idx + self.segment_samples, audio_length)
 
             # Extract segment
             if use_stereo:
-                segment = input_audio[:, start_idx:end_idx]  # (2, segment_length)
+                segment = input_audio[:, start_idx:end_idx].clone()
             else:
-                segment = input_audio[start_idx:end_idx]  # (segment_length,)
-
-            # Process segment
-            enhanced_segment = self._process_segment(segment)
+                segment = input_audio[start_idx:end_idx].clone()
 
             # Apply windowing for smooth overlap
-            if i > 0 or i < num_segments - 1:  # Not first or last segment
-                enhanced_segment = self._apply_window(enhanced_segment)
+            windowed_segment = self._apply_window(segment)
 
-            # Add to output with overlap handling
+            # Process segment
+            enhanced_segment = self._process_segment(windowed_segment)
+
+            # Add to output with proper overlap-add
+            actual_length = (
+                enhanced_segment.shape[-1] if use_stereo else len(enhanced_segment)
+            )
+            actual_end = start_idx + actual_length
+
             if use_stereo:
-                actual_length = enhanced_segment.shape[-1]
-                output_audio[
-                    :, start_idx : start_idx + actual_length
-                ] += enhanced_segment
-                overlap_counts[:, start_idx : start_idx + actual_length] += 1
+                # Get the window weights for proper overlap-add
+                if actual_length == self.segment_samples:
+                    # Full segment
+                    window_weights = torch.ones_like(enhanced_segment)
+                    fade_samples = self.overlap_samples
+                    if fade_samples > 0:
+                        fade_in = torch.hann_window(2 * fade_samples)[:fade_samples]
+                        fade_out = torch.hann_window(2 * fade_samples)[fade_samples:]
+                        window_weights[:, :fade_samples] = fade_in.unsqueeze(0)
+                        window_weights[:, -fade_samples:] = fade_out.unsqueeze(0)
+                else:
+                    # Partial segment
+                    window_weights = torch.ones_like(enhanced_segment)
+
+                output_audio[:, start_idx:actual_end] += (
+                    enhanced_segment * window_weights
+                )
+                weight_buffer[:, start_idx:actual_end] += window_weights
             else:
-                actual_length = len(enhanced_segment)
-                output_audio[start_idx : start_idx + actual_length] += enhanced_segment
-                overlap_counts[start_idx : start_idx + actual_length] += 1
+                # Get the window weights for proper overlap-add
+                if actual_length == self.segment_samples:
+                    # Full segment
+                    window_weights = torch.ones_like(enhanced_segment)
+                    fade_samples = self.overlap_samples
+                    if fade_samples > 0:
+                        fade_in = torch.hann_window(2 * fade_samples)[:fade_samples]
+                        fade_out = torch.hann_window(2 * fade_samples)[fade_samples:]
+                        window_weights[:fade_samples] = fade_in
+                        window_weights[-fade_samples:] = fade_out
+                else:
+                    # Partial segment
+                    window_weights = torch.ones_like(enhanced_segment)
 
-        if show_progress:
-            print()  # New line after progress
+                output_audio[start_idx:actual_end] += enhanced_segment * window_weights
+                weight_buffer[start_idx:actual_end] += window_weights
 
-        # Normalize by overlap counts
-        output_audio = output_audio / torch.clamp(overlap_counts, min=1)
+        # Normalize by accumulated weights to complete overlap-add
+        # Avoid division by zero
+        weight_buffer = torch.clamp(weight_buffer, min=1e-8)
+        output_audio = output_audio / weight_buffer
+
+        # Final safety check
+        if torch.isnan(output_audio).any() or torch.isinf(output_audio).any():
+            print("⚠️  Numerical issues in final output, using original audio")
+            return input_audio
 
         return output_audio
 
     def process_file(
         self, input_path: str, output_path: str, target_lufs: float = -1.0
     ) -> None:
-        """Process audio file from input to output"""
+        """Process audio file with improved error handling and LUFS normalization"""
         start_time = time.time()
 
-        # Load input audio
-        input_audio = self._load_audio(input_path)
+        try:
+            # Load audio
+            input_audio = self._load_audio(input_path)
 
-        # Process audio
-        print("🎵 Starting audio enhancement...")
-        enhanced_audio = self.process_audio(input_audio)
+            print(f"🎵 Processing audio...")
 
-        # Post-processing: limiting to target LUFS
-        if target_lufs is not None:
-            enhanced_audio = self._apply_limiter(enhanced_audio, target_lufs)
+            # Process audio
+            enhanced_audio = self.process_audio(input_audio, show_progress=True)
 
-        # Save output
-        self._save_audio(enhanced_audio, output_path)
+            # Apply LUFS normalization if requested
+            if target_lufs > -70:  # Valid LUFS range
+                enhanced_audio = self._apply_limiter(enhanced_audio, target_lufs)
 
-        # Performance metrics
-        processing_time = time.time() - start_time
-        audio_duration = len(input_audio) / self.sample_rate
-        rtf = processing_time / audio_duration
+            # Save output
+            self._save_audio(enhanced_audio, output_path)
 
-        print(f"✅ Processing complete!")
-        print(f"📊 Audio duration: {audio_duration:.2f}s")
-        print(f"📊 Processing time: {processing_time:.2f}s")
-        print(f"📊 Real-time factor: {rtf:.3f}x")
-        print(f"💾 Output saved to: {output_path}")
+            processing_time = time.time() - start_time
+            audio_duration = (
+                input_audio.shape[-1] / self.sample_rate
+                if input_audio.dim() > 1
+                else len(input_audio) / self.sample_rate
+            )
+            rtf = processing_time / audio_duration
+
+            print(f"✅ Processing completed in {processing_time:.2f}s")
+            print(f"📊 Real-time factor: {rtf:.2f}x")
+            print(f"💾 Output saved to: {output_path}")
+
+        except Exception as e:
+            print(f"❌ Processing failed: {e}")
+            raise
 
     def _apply_limiter(self, audio: torch.Tensor, target_lufs: float) -> torch.Tensor:
-        """Apply simple limiter to achieve target LUFS"""
-        # Simple peak limiting - in production you'd use proper LUFS metering
-        current_peak = torch.max(torch.abs(audio))
-        target_peak = 10 ** (target_lufs / 20)  # Rough LUFS to peak conversion
+        """Apply basic limiter and LUFS normalization"""
+        # Simple peak limiting
+        audio = torch.clamp(audio, -0.95, 0.95)
 
-        if current_peak > target_peak:
-            ratio = target_peak / current_peak
-            audio = audio * ratio
-            print(f"🔧 Applied limiting: {20*torch.log10(ratio):.1f}dB reduction")
+        # Basic RMS-based loudness adjustment (approximation of LUFS)
+        if audio.dim() > 1:  # Stereo
+            rms = torch.sqrt(torch.mean(audio**2))
+        else:  # Mono
+            rms = torch.sqrt(torch.mean(audio**2))
+
+        # Convert target LUFS to approximate RMS (rough approximation)
+        target_rms = 10 ** (target_lufs / 20.0)
+
+        if rms > 1e-8:  # Avoid division by zero
+            gain = target_rms / rms
+            gain = min(gain, 10.0)  # Limit maximum gain
+            audio = audio * gain
 
         return audio
 
     def _save_audio(self, audio: torch.Tensor, output_path: str) -> None:
-        """Save audio to file"""
-        print(f"💾 Saving audio to {output_path}")
+        """Save audio with improved format handling"""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Ensure output directory exists
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        # Convert to numpy for saving
+        if audio.dim() > 1:  # Stereo
+            audio_np = audio.cpu().numpy()
+        else:  # Mono
+            audio_np = audio.cpu().numpy()
 
-        # Convert to numpy and ensure correct format
-        use_stereo = self.config["model"]["unet"].get("use_stereo", False)
+        # Ensure audio is in the right shape for saving
+        if audio_np.ndim == 1:
+            # Mono: keep as (T,)
+            pass
+        elif audio_np.ndim == 2:
+            # Stereo: transpose to (T, 2) for soundfile
+            audio_np = audio_np.T
 
-        if use_stereo:
-            # Stereo: audio shape is (2, T) -> transpose to (T, 2) for soundfile
-            audio_np = audio.transpose(0, 1).numpy().astype(np.float32)
-        else:
-            # Mono: audio shape is (T,)
-            audio_np = audio.numpy().astype(np.float32)
-
-        # Clamp to prevent clipping
+        # Clamp to valid range
         audio_np = np.clip(audio_np, -1.0, 1.0)
 
-        # Save with high quality settings
-        sf.write(
-            output_path, audio_np, self.sample_rate, subtype="PCM_24"  # 24-bit PCM
-        )
-
-        print(f"✅ Audio saved successfully")
+        # Save with appropriate format
+        try:
+            sf.write(str(output_path), audio_np, self.sample_rate, subtype="PCM_24")
+            print(f"💾 Saved as 24-bit audio: {output_path}")
+        except Exception as e:
+            print(f"⚠️  Failed to save as 24-bit, trying 16-bit: {e}")
+            sf.write(str(output_path), audio_np, self.sample_rate, subtype="PCM_16")
+            print(f"💾 Saved as 16-bit audio: {output_path}")
 
 
 def benchmark_model(config: dict, checkpoint_path: str, duration: float = 10.0) -> None:
-    """Benchmark model performance"""
-    print(f"🏃 Benchmarking model performance ({duration}s test audio)")
+    """Benchmark model performance with various audio lengths"""
+    print(f"🏃 Benchmarking model performance...")
 
-    # Create inferencer
     inferencer = AudioInferencer(config, checkpoint_path)
 
-    # Generate test audio
-    sample_rate = config["data"]["sample_rate"]
-    test_samples = int(sample_rate * duration)
-    test_audio = torch.randn(test_samples)
+    # Test different audio lengths
+    durations = [1.0, 5.0, 10.0, 30.0]
+    use_stereo = config["model"]["unet"].get("use_stereo", False)
 
-    # Warm up
-    print("🔥 Warming up...")
-    _ = inferencer.process_audio(test_audio, show_progress=False)
+    for test_duration in durations:
+        if test_duration > duration:
+            continue
 
-    # Benchmark
-    print("📊 Running benchmark...")
-    start_time = time.time()
+        print(f"\n⏱️  Testing {test_duration}s audio...")
 
-    num_runs = 3
-    for i in range(num_runs):
-        _ = inferencer.process_audio(test_audio, show_progress=False)
+        # Generate test audio
+        num_samples = int(test_duration * config["data"]["sample_rate"])
+        if use_stereo:
+            test_audio = torch.randn(2, num_samples) * 0.1
+        else:
+            test_audio = torch.randn(num_samples) * 0.1
 
-    total_time = time.time() - start_time
-    avg_time = total_time / num_runs
-    rtf = avg_time / duration
+        # Benchmark processing
+        start_time = time.time()
+        enhanced_audio = inferencer.process_audio(test_audio, show_progress=False)
+        processing_time = time.time() - start_time
 
-    print(f"📊 Average processing time: {avg_time:.3f}s")
-    print(f"📊 Real-time factor: {rtf:.3f}x")
-    print(f"📊 Throughput: {duration/avg_time:.2f}x real-time")
+        rtf = processing_time / test_duration
+        print(f"📊 Processing time: {processing_time:.3f}s, RTF: {rtf:.3f}x")
+
+        # Memory usage (if on CUDA)
+        if torch.cuda.is_available():
+            memory_used = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"🧠 Peak GPU memory: {memory_used:.2f} GB")
+            torch.cuda.reset_peak_memory_stats()
 
 
 def main():
     """Main inference function"""
     parser = argparse.ArgumentParser(description="Concert2Studio Audio Enhancement")
-    parser.add_argument(
-        "--input", "-i", type=str, required=True, help="Input audio file path"
-    )
-    parser.add_argument(
-        "--output", "-o", type=str, required=True, help="Output audio file path"
-    )
-    parser.add_argument(
-        "--checkpoint",
-        "-c",
-        type=str,
-        default="checkpoints/best.pt",
-        help="Model checkpoint path",
-    )
+    parser.add_argument("input", type=str, help="Input audio file path")
+    parser.add_argument("output", type=str, help="Output audio file path")
     parser.add_argument(
         "--config", type=str, default="config.yaml", help="Configuration file path"
     )
     parser.add_argument(
-        "--device",
+        "--checkpoint",
         type=str,
-        default="auto",
-        choices=["auto", "cpu", "cuda"],
-        help="Device to use for inference",
+        default="checkpoints/best_model.pt",
+        help="Model checkpoint path",
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto", help="Device to use (auto, cpu, cuda)"
     )
     parser.add_argument(
         "--target-lufs",
         type=float,
-        default=-1.0,
-        help="Target LUFS for output limiting",
+        default=-23.0,
+        help="Target LUFS level (-70 to disable)",
     )
     parser.add_argument(
         "--benchmark", action="store_true", help="Run performance benchmark"
@@ -456,43 +523,28 @@ def main():
     args = parser.parse_args()
 
     # Load configuration
-    if not Path(args.config).exists():
+    try:
+        with open(args.config, "r") as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
         print(f"❌ Configuration file not found: {args.config}")
         return
-
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-
-    # Check checkpoint
-    if not Path(args.checkpoint).exists():
-        print(f"❌ Checkpoint not found: {args.checkpoint}")
-        print("Available checkpoints:")
-        checkpoint_dir = Path("checkpoints")
-        if checkpoint_dir.exists():
-            for ckpt in checkpoint_dir.glob("*.pt"):
-                print(f"  - {ckpt}")
+    except Exception as e:
+        print(f"❌ Error loading configuration: {e}")
         return
 
-    # Run benchmark if requested
-    if args.benchmark:
-        try:
-            benchmark_model(config, args.checkpoint)
-        except Exception as e:
-            print(f"❌ Benchmark failed: {e}")
-        return
-
-    # Check input file
-    if not Path(args.input).exists():
-        print(f"❌ Input file not found: {args.input}")
-        return
-
-    # Create inferencer and process file
     try:
-        inferencer = AudioInferencer(config, args.checkpoint, args.device)
-        inferencer.process_file(args.input, args.output, args.target_lufs)
+        if args.benchmark:
+            benchmark_model(config, args.checkpoint)
+        else:
+            # Initialize inferencer
+            inferencer = AudioInferencer(config, args.checkpoint, args.device)
+
+            # Process file
+            inferencer.process_file(args.input, args.output, args.target_lufs)
 
     except Exception as e:
-        print(f"❌ Processing failed: {e}")
+        print(f"❌ Inference failed: {e}")
         import traceback
 
         traceback.print_exc()

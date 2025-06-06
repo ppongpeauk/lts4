@@ -4,81 +4,97 @@
 # Data Configuration
 data:
   data_dir: "./data"
-  sample_rate: 44100  # Use 48kHz for better audio quality and noise reduction
+  sample_rate: 44100  # Standard audio quality for better compatibility
   bit_depth: 24
   train_split: 0.9
   val_split: 0.1
   random_seed: 42
   use_synthetic: true  # Enable synthetic data for better generalization
 
-# Audio Processing (optimized for 48kHz)
+  # LUFS normalization settings (critical for consistent training)
+  enable_lufs_normalization: true  # Enable LUFS normalization
+  target_lufs: -23.0  # EBU R128 broadcast standard
+  lufs_tolerance: 2.0  # ±2 LUFS tolerance before normalization
+
+  # Audio quality processing
+  enable_dc_removal: true  # Remove DC offset
+  enable_peak_limiting: true  # Prevent clipping
+  peak_threshold: 0.95  # Peak limiting threshold
+
+# Audio Processing (optimized for stability and quality)
 audio:
-  segment_length: 8.0  # Longer segments for better context
-  n_fft: 1024  # Larger FFT for better frequency resolution
-  hop_length: 256
+  segment_length: 4.0  # Moderate segments for better training
+  n_fft: 1024  # Optimal FFT size for balance of resolution and stability
+  hop_length: 256  # 75% overlap for better reconstruction
   win_length: 1024
   window: "hann"
 
 # Model Architecture
 model:
-  # Spectrogram U-Net (optimized for small dataset + stereo)
+  # Spectrogram U-Net (SIMPLIFIED for initial learning)
   unet:
-    in_channels: 513  # Frequency bins for 1024 FFT (1024//2 + 1)
-    base_channels: 16  # Reduced capacity to prevent overfitting
-    max_channels: 128   # Much smaller capacity for tiny dataset
-    n_blocks: 3        # Fewer blocks to reduce complexity
-    dilations: [1, 2, 4]  # Simplified receptive fields
-    use_attention: false  # Disable attention to reduce overfitting
+    in_channels: 1  # Single channel magnitude spectrogram (CORRECTED)
+    base_channels: 16  # REDUCED from 32 for simplicity
+    max_channels: 128   # REDUCED from 256 for simplicity
+    n_blocks: 3        # REDUCED from 4 for simplicity
+    dilations: [1, 2, 4]  # SIMPLIFIED dilation pattern
+    use_attention: false  # DISABLED for simplicity initially
     attention_heads: 2
-    dropout: 0.3  # Aggressive dropout for regularization
+    dropout: 0.1  # REDUCED dropout for better learning
     use_stereo: true  # Enable stereo processing
 
-  # Enhanced UnivNet Vocoder (with noise reduction)
-  use_vocoder: true  # Keep vocoder for quality enhancement
+  # Enhanced UnivNet Vocoder (DISABLED for debugging)
+  use_vocoder: false  # DISABLE vocoder to isolate U-Net issues
   vocoder:
     model_name: "univnet-c32"
     pretrained: false  # Train from scratch for better fit
-    freeze_epochs: 25  # Freeze much longer to establish stable UNet first
+    freeze_epochs: 5  # Much shorter freeze period for better adaptation
     use_stereo: true  # Enable stereo output
 
-# Training Configuration (anti-overfitting for tiny dataset)
+# Training Configuration (FIXED for stability)
 training:
-  batch_size: 1  # Small but efficient batches
+  batch_size: 2  # Conservative batch size for stability
   num_epochs: 50  # More training with better regularization
-  learning_rate: 5e-6  # Much more conservative for tiny dataset
-  weight_decay: 1e-3  # Increased L2 regularization to prevent overfitting
-  beta1: 0.9  # Standard Adam parameters
-  beta2: 0.999
-  warmup_steps: 500  # Much longer warmup for stability
-  early_stopping_patience: 5  # Less patience to stop overfitting quickly
+  learning_rate: 1e-6  # MUCH more conservative - was 5e-5, now 1e-6
+  weight_decay: 1e-4  # Reduced regularization
+  beta1: 0.9  # Standard momentum for stability
+  beta2: 0.999  # Standard for stability
+  warmup_steps: 100  # Shorter warmup
+  early_stopping_patience: 15  # More patience for gradual quality improvement
   gradient_accumulation_steps: 4  # Effective batch size 8
-  max_grad_norm: 0.3  # Even stricter gradient clipping
-  scheduler: "linear"  # Linear decay instead of cosine for stability
+  max_grad_norm: 0.1  # Much more aggressive gradient clipping
+  scheduler: "cosine"  # Cosine annealing as per PRD
 
-# Loss Configuration (simplified for stability)
+  # Advanced training stability features (NEW)
+  conservative_mode: true  # Enable conservative training mode
+  stability_check_interval: 100  # Check for NaN/Inf every N steps
+
+# Loss Configuration (SIMPLIFIED and RESCALED to prevent instability)
 loss:
-  l1_weight: 1.0  # Focus primarily on L1 reconstruction
-  multires_stft_weight: 0.0  # Disable spectral loss initially for stability
-  vggish_weight: 0.0  # Disabled heavy perceptual loss
-  adversarial_weight: 0.0  # Disabled for stability
+  l1_weight: 1.0  # Main loss - start with just this
+  multires_stft_weight: 0.1  # Drastically reduced from 0.4
+  vggish_weight: 0.01  # Drastically reduced from 0.1
+  spectral_convergence_weight: 0.0  # DISABLED for now
+  magnitude_phase_consistency_weight: 0.0  # DISABLED for now
+  adversarial_weight: 0.0  # Keep disabled for stability
 
-  # Multi-resolution STFT scales (reduced for stability)
-  stft_scales: [512, 1024, 2048]
+  # Multi-resolution STFT scales (SMALLER scales to reduce loss magnitude)
+  stft_scales: [256, 512, 1024]  # Removed large scales
 
-# Data Augmentation (aggressive anti-overfitting for tiny dataset)
+# Data Augmentation (balanced for training robustness)
 augmentation:
-  gain_jitter_db: 2.0  # Increased variation to improve generalization
-  gain_jitter_prob: 0.7  # Higher probability for more diversity
-  pink_noise_prob: 0.4  # More noise augmentation
-  pink_noise_level: -45  # Slightly more noticeable noise
-  time_shift_ms: 40  # More time variation
-  time_shift_prob: 0.6  # Higher probability
-  # Advanced augmentation techniques from research
-  mixup_prob: 0.3  # Enable mixup for better generalization
-  mixup_alpha: 0.3  # Moderate mixing
-  spec_augment_prob: 0.4  # Enable spectrogram augmentation
-  freq_mask_prob: 0.2
-  time_mask_prob: 0.2
+  gain_jitter_db: 3.0  # As per PRD
+  gain_jitter_prob: 0.5  # Reasonable probability
+  pink_noise_prob: 0.2  # As per PRD
+  pink_noise_level: -40  # Moderate noise level
+  time_shift_ms: 50  # As per PRD
+  time_shift_prob: 0.5  # Reasonable probability
+  # Advanced augmentation disabled for stability during initial training
+  mixup_prob: 0.0  # Can be enabled later
+  mixup_alpha: 0.3
+  spec_augment_prob: 0.0  # Can be enabled later
+  freq_mask_prob: 0.0
+  time_mask_prob: 0.0
 
 # Checkpointing and Logging
 checkpoint:

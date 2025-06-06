@@ -14,6 +14,7 @@ import random
 from pathlib import Path
 from typing import Tuple, List, Optional
 import warnings
+import pyloudnorm as pyln
 
 
 class ConcertDataset(Dataset):
@@ -52,10 +53,31 @@ class ConcertDataset(Dataset):
         # Stereo support
         self.use_stereo = config["model"]["unet"].get("use_stereo", False)
 
+        # LUFS normalization settings
+        self.target_lufs = config["data"].get("target_lufs", -23.0)  # EBU R128 standard
+        self.lufs_tolerance = config["data"].get(
+            "lufs_tolerance", 2.0
+        )  # ±2 LUFS tolerance
+
+        # Initialize loudness meter
+        self.meter = pyln.Meter(self.sample_rate)
+
+        # Audio quality settings
+        self.enable_lufs_normalization = config["data"].get(
+            "enable_lufs_normalization", True
+        )
+        self.enable_dc_removal = config["data"].get("enable_dc_removal", True)
+        self.enable_peak_limiting = config["data"].get("enable_peak_limiting", True)
+        self.peak_threshold = config["data"].get("peak_threshold", 0.95)
+
         # Find all audio file pairs
         self.audio_pairs = self._find_audio_pairs()
 
         print(f"Found {len(self.audio_pairs)} audio pairs in {data_dir}")
+        if self.enable_lufs_normalization:
+            print(
+                f"📊 LUFS normalization enabled: target {self.target_lufs} LUFS ±{self.lufs_tolerance}"
+            )
 
     def _find_audio_pairs(self) -> List[Tuple[str, str]]:
         """
@@ -84,6 +106,99 @@ class ConcertDataset(Dataset):
                         pairs.append((str(concert_file), str(studio_file)))
 
         return pairs
+
+    def _normalize_lufs(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Normalize audio to target LUFS level"""
+        if not self.enable_lufs_normalization:
+            return waveform
+
+        try:
+            # Convert to numpy for pyloudnorm
+            if self.use_stereo and waveform.dim() == 2:
+                # Stereo: (2, T) -> (T, 2) for pyloudnorm
+                audio_np = waveform.transpose(0, 1).numpy().astype(np.float64)
+            else:
+                # Mono: (T,) -> (T,) for pyloudnorm
+                audio_np = waveform.numpy().astype(np.float64)
+
+            # Measure current loudness
+            try:
+                current_loudness = self.meter.integrated_loudness(audio_np)
+
+                # Skip normalization if the measurement failed or audio is too quiet
+                if current_loudness == float("-inf") or current_loudness < -70.0:
+                    # Very quiet audio - apply gentle gain instead of LUFS normalization
+                    gain_db = self.target_lufs - (
+                        -40.0
+                    )  # Assume -40 LUFS for quiet audio
+                    gain_linear = 10 ** (gain_db / 20.0)
+                    normalized_audio = audio_np * gain_linear
+                else:
+                    # Calculate required gain
+                    gain_db = self.target_lufs - current_loudness
+
+                    # Limit gain to prevent extreme adjustments
+                    gain_db = np.clip(gain_db, -20.0, 20.0)  # ±20dB max adjustment
+
+                    # Apply gain only if needed (outside tolerance)
+                    if abs(gain_db) > self.lufs_tolerance:
+                        gain_linear = 10 ** (gain_db / 20.0)
+                        normalized_audio = audio_np * gain_linear
+                    else:
+                        normalized_audio = audio_np
+
+            except Exception as e:
+                # Fallback: simple RMS normalization
+                rms = np.sqrt(np.mean(audio_np**2))
+                if rms > 1e-8:  # Avoid division by zero
+                    target_rms = 10 ** (
+                        self.target_lufs / 20.0
+                    )  # Rough LUFS to RMS conversion
+                    gain = target_rms / rms
+                    gain = np.clip(gain, 0.1, 10.0)  # Limit gain to reasonable range
+                    normalized_audio = audio_np * gain
+                else:
+                    normalized_audio = audio_np
+
+            # Convert back to torch tensor
+            normalized_audio = normalized_audio.astype(np.float32)
+
+            if self.use_stereo and waveform.dim() == 2:
+                # Convert back to (2, T) format
+                result = torch.from_numpy(normalized_audio.T)
+            else:
+                result = torch.from_numpy(normalized_audio)
+
+            return result
+
+        except Exception as e:
+            warnings.warn(f"LUFS normalization failed: {e}")
+            return waveform
+
+    def _apply_audio_quality_processing(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Apply audio quality processing: DC removal, peak limiting, etc."""
+
+        # DC removal (remove DC offset)
+        if self.enable_dc_removal:
+            if self.use_stereo and waveform.dim() == 2:
+                # Remove DC from each channel
+                waveform = waveform - torch.mean(waveform, dim=1, keepdim=True)
+            else:
+                waveform = waveform - torch.mean(waveform)
+
+        # Peak limiting to prevent clipping
+        if self.enable_peak_limiting:
+            peak = torch.max(torch.abs(waveform))
+            if peak > self.peak_threshold:
+                # Apply gentle compression instead of hard limiting
+                ratio = self.peak_threshold / peak
+                # Soft limiting with gentle curve
+                waveform = waveform * ratio * 0.95  # 5% safety margin
+
+        # Final safety clamp
+        waveform = torch.clamp(waveform, -1.0, 1.0)
+
+        return waveform
 
     def _load_and_resample_audio(self, file_path: str) -> torch.Tensor:
         """
@@ -120,12 +235,19 @@ class ConcertDataset(Dataset):
                 elif waveform.shape[0] > 2:
                     # Take first two channels if more than stereo
                     waveform = waveform[:2]
+                # Apply audio quality processing and LUFS normalization
+                waveform = self._apply_audio_quality_processing(waveform)
+                waveform = self._normalize_lufs(waveform)
                 return waveform  # Keep (2, T) shape for stereo
             else:
                 # Convert to mono if stereo
                 if waveform.shape[0] > 1:
                     waveform = torch.mean(waveform, dim=0, keepdim=True)
-                return waveform.squeeze(0)  # Remove channel dimension (T,)
+                waveform = waveform.squeeze(0)  # Remove channel dimension (T,)
+                # Apply audio quality processing and LUFS normalization
+                waveform = self._apply_audio_quality_processing(waveform)
+                waveform = self._normalize_lufs(waveform)
+                return waveform
 
         except Exception as e:
             # Fallback to librosa for problematic files
@@ -140,9 +262,18 @@ class ConcertDataset(Dataset):
                     )  # Convert to pseudo-stereo
                 elif waveform.shape[0] > 2:
                     waveform = waveform[:2]  # Take first two channels
+
+                # Apply audio quality processing and LUFS normalization for stereo librosa fallback
+                waveform = self._apply_audio_quality_processing(waveform)
+                waveform = self._normalize_lufs(waveform)
             else:
                 waveform, _ = librosa.load(file_path, sr=self.sample_rate, mono=True)
                 waveform = torch.from_numpy(waveform)
+
+            # Apply audio quality processing and LUFS normalization for librosa fallback
+            waveform = self._apply_audio_quality_processing(waveform)
+            waveform = self._normalize_lufs(waveform)
+
             return waveform
 
     def _apply_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
