@@ -24,11 +24,11 @@ model:
   # Spectrogram U-Net
   unet:
     in_channels: 513  # n_fft//2 + 1
-    base_channels: 48
-    max_channels: 768
-    n_blocks: 6
+    base_channels: 32
+    max_channels: 256
+    n_blocks: 5
     dilations: [1, 2, 4, 8]
-    use_attention: true
+    use_attention: false
     attention_heads: 1
 
   # UnivNet Vocoder
@@ -81,7 +81,7 @@ hardware:
   pin_memory: true
   persistent_workers: true
   compile_model: true  # Use torch.compile for speedup
-  channels_last: true  # Memory layout optimization
+  channels_last: false  # Not applicable to audio models
 
 # Paths
 paths:

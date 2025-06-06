@@ -119,9 +119,8 @@ class Trainer:
                 if self.accelerator.is_main_process:
                     print(f"⚠️  torch.compile failed: {e}")
 
-        # Set channels_last memory format
-        if config["hardware"]["channels_last"]:
-            self.model = self.model.to(memory_format=torch.channels_last)
+        # Note: channels_last memory format is not applicable to audio models
+        # Audio models work with 2D/3D tensors, not 4D image tensors
 
     def create_directories(self):
         """Create necessary directories"""
@@ -239,10 +238,8 @@ class Trainer:
         """Single training step"""
         concert_audio, studio_audio = batch
 
-        # Set channels_last memory format if enabled
-        if self.config["hardware"]["channels_last"]:
-            concert_audio = concert_audio.to(memory_format=torch.channels_last)
-            studio_audio = studio_audio.to(memory_format=torch.channels_last)
+        # Note: channels_last is not applicable to audio tensors (2D/3D)
+        # Audio tensors don't benefit from channels_last memory format
 
         # Forward pass
         with self.accelerator.autocast():
@@ -276,10 +273,8 @@ class Trainer:
             ):
                 concert_audio, studio_audio = batch
 
-                # Set channels_last memory format if enabled
-                if self.config["hardware"]["channels_last"]:
-                    concert_audio = concert_audio.to(memory_format=torch.channels_last)
-                    studio_audio = studio_audio.to(memory_format=torch.channels_last)
+                # Note: channels_last is not applicable to audio tensors (2D/3D)
+                # Audio tensors don't benefit from channels_last memory format
 
                 with self.accelerator.autocast():
                     enhanced_audio, losses = self.model(concert_audio, studio_audio)
@@ -424,9 +419,19 @@ def main():
         config["paths"]["output_dir"] = args.output_dir
 
     # Initialize accelerator
+    # Determine mixed precision based on available hardware
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        mixed_precision = "bf16"
+    elif torch.cuda.is_available():
+        mixed_precision = "fp16"
+    else:
+        mixed_precision = "no"  # CPU or MPS doesn't support mixed precision
+
     accelerator = Accelerator(
-        gradient_accumulation_steps=config["training"]["gradient_accumulation_steps"],
-        mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16",
+        gradient_accumulation_steps=int(
+            config["training"]["gradient_accumulation_steps"]
+        ),
+        mixed_precision=mixed_precision,
         log_with="tensorboard",
         project_dir=config["paths"]["log_dir"],
     )
