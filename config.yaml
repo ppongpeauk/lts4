@@ -23,7 +23,7 @@ audio:
 model:
   # Spectrogram U-Net (optimized for small dataset + stereo)
   unet:
-    in_channels: 257  # Frequency bins for 1024 FFT (1024//2 + 1)
+    in_channels: 513  # Frequency bins for 1024 FFT (1024//2 + 1)
     base_channels: 8  # Increased capacity
     max_channels: 64  # Reasonable capacity
     n_blocks: 3  # More blocks for better learning
