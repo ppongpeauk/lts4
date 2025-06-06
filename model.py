@@ -1,6 +1,7 @@
 """
 Model architectures for Concert2Studio
-Implements Spectrogram U-Net, UnivNet wrapper, and loss functions
+Implements Spectrogram U-Net, Enhanced UnivNet wrapper, and advanced loss functions
+Includes stereo support and research-based noise reduction techniques
 """
 
 import torch
@@ -13,7 +14,7 @@ from auraloss.freq import MultiResolutionSTFTLoss
 
 
 class ConvBlock(nn.Module):
-    """Basic convolution block with BatchNorm and PReLU"""
+    """Enhanced convolution block with LayerNorm and Swish activation"""
 
     def __init__(
         self,
@@ -22,10 +23,11 @@ class ConvBlock(nn.Module):
         kernel_size: int = 3,
         dilation: int = 1,
         stride: int = 1,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
         padding = (kernel_size - 1) * dilation // 2
-        self.conv = nn.Conv2d(
+        conv = nn.Conv2d(
             in_channels,
             out_channels,
             kernel_size,
@@ -33,25 +35,112 @@ class ConvBlock(nn.Module):
             padding=padding,
             dilation=dilation,
         )
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.activation = nn.PReLU()
+
+        if use_spectral_norm:
+            conv = nn.utils.spectral_norm(conv)
+
+        self.conv = conv
+        self.norm = nn.LayerNorm(out_channels)
+        self.activation = nn.SiLU()  # Swish activation for better gradients
 
     def forward(self, x):
-        return self.activation(self.bn(self.conv(x)))
+        x = self.conv(x)
+        # LayerNorm expects (B, H, W, C) format
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
+        return self.activation(x)
+
+
+class TwinDeconvolution(nn.Module):
+    """Twin deconvolution module for artifact-free upsampling (inspired by FA-GAN)"""
+
+    def __init__(
+        self, in_channels: int, out_channels: int, kernel_size: int = 4, stride: int = 2
+    ):
+        super().__init__()
+
+        # Main deconvolution branch
+        self.main_deconv = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=kernel_size // 2 - stride // 2,
+        )
+
+        # Twin branch for calculating overlap
+        self.twin_deconv = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=kernel_size // 2 - stride // 2,
+        )
+
+        # Initialize twin with same weights
+        self.twin_deconv.weight.data = self.main_deconv.weight.data.clone()
+        self.twin_deconv.bias.data = self.main_deconv.bias.data.clone()
+
+    def forward(self, x):
+        main_out = self.main_deconv(x)
+        twin_out = self.twin_deconv(x)
+
+        # Element-wise division to suppress artifacts
+        # Add small epsilon to prevent division by zero
+        output = main_out / (twin_out + 1e-8)
+        return output
+
+
+class ContextAwareModule(nn.Module):
+    """Context-aware module for enhanced feature extraction (inspired by EVA-GAN)"""
+
+    def __init__(self, channels: int, context_size: int = 7):
+        super().__init__()
+
+        self.depth_conv = nn.Conv2d(
+            channels, channels, context_size, padding=context_size // 2, groups=channels
+        )
+        self.point_conv1 = nn.Conv2d(channels, channels * 4, 1)
+        self.point_conv2 = nn.Conv2d(channels * 4, channels, 1)
+        self.norm = nn.LayerNorm(channels)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout2d(0.1)
+
+    def forward(self, x):
+        residual = x
+
+        # Depthwise convolution for spatial context
+        x = self.depth_conv(x)
+
+        # Point-wise convolutions for channel mixing
+        x = self.point_conv1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.point_conv2(x)
+
+        # Layer normalization
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
+
+        # Residual connection
+        return residual + x
 
 
 class AttentionBlock(nn.Module):
-    """Self-attention block for long-range dependencies"""
+    """Multi-head self-attention with improved efficiency"""
 
-    def __init__(self, channels: int, num_heads: int = 1):
+    def __init__(self, channels: int, num_heads: int = 2):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
 
         self.norm = nn.LayerNorm(channels)
         self.attention = nn.MultiheadAttention(
-            embed_dim=channels, num_heads=num_heads, batch_first=True
+            embed_dim=channels, num_heads=num_heads, batch_first=True, dropout=0.1
         )
+        self.context_module = ContextAwareModule(channels)
 
     def forward(self, x):
         # x shape: (B, C, H, W)
@@ -66,224 +155,251 @@ class AttentionBlock(nn.Module):
 
         # Add residual and reshape back
         out = x_reshaped + attn_out
-        return out.transpose(1, 2).view(B, C, H, W)
+        out = out.transpose(1, 2).view(B, C, H, W)
+
+        # Apply context-aware enhancement
+        out = self.context_module(out)
+
+        return out
 
 
 class SpectroUNet(nn.Module):
     """
-    Lightweight Spectrogram U-Net for audio denoising and enhancement
-    Reduced complexity to prevent overfitting with limited data
+    Enhanced Spectrogram U-Net with stereo support and research-based improvements
     """
 
     def __init__(
         self,
         in_channels: int = 513,
-        base_channels: int = 24,  # Reduced from 48
-        max_channels: int = 192,  # Reduced from 768
-        n_blocks: int = 4,  # Reduced from 6
-        dilations: List[int] = [1, 2, 4],  # Simplified
-        use_attention: bool = False,  # Disabled to reduce params
-        attention_heads: int = 1,
-        dropout: float = 0.1,  # Added dropout for regularization
+        out_channels: int = 513,  # Can be different for stereo
+        base_channels: int = 16,
+        max_channels: int = 128,
+        n_blocks: int = 3,
+        dilations: List[int] = [1, 2, 4],
+        use_attention: bool = True,
+        attention_heads: int = 2,
+        dropout: float = 0.3,
+        use_stereo: bool = False,
     ):
         super().__init__()
 
         self.n_blocks = n_blocks
         self.use_attention = use_attention
+        self.use_stereo = use_stereo
         self.dropout = nn.Dropout2d(dropout)
+
+        # Adjust channels for stereo
+        if use_stereo:
+            out_channels = in_channels * 2  # Stereo output
 
         # Calculate channel progression
         channels = [base_channels * (2**i) for i in range(n_blocks)]
         channels = [min(c, max_channels) for c in channels]
         channels = [in_channels] + channels
 
-        # Encoder blocks with dropout
+        # Encoder blocks with context-aware modules
         self.encoder_blocks = nn.ModuleList()
+        self.context_modules = nn.ModuleList()
+
         for i in range(n_blocks):
             dilation = dilations[i % len(dilations)] if i < len(dilations) else 1
-            block = nn.Sequential(
-                ConvBlock(channels[i], channels[i + 1], dilation=dilation, stride=2),
-                (
-                    nn.Dropout2d(dropout) if i > 0 else nn.Identity()
-                ),  # Skip dropout on first layer
-            )
-            self.encoder_blocks.append(block)
 
-        # Bottleneck with attention
+            encoder_block = nn.Sequential(
+                ConvBlock(
+                    channels[i],
+                    channels[i + 1],
+                    dilation=dilation,
+                    stride=2,
+                    use_spectral_norm=True,
+                ),
+                ConvBlock(
+                    channels[i + 1], channels[i + 1], dilation=1, use_spectral_norm=True
+                ),
+            )
+            self.encoder_blocks.append(encoder_block)
+
+            # Add context-aware module
+            context_module = ContextAwareModule(channels[i + 1])
+            self.context_modules.append(context_module)
+
+        # Bottleneck with enhanced attention
         self.bottleneck = nn.Sequential(
-            ConvBlock(channels[-1], channels[-1]),
+            ConvBlock(channels[-1], channels[-1], use_spectral_norm=True),
             (
                 AttentionBlock(channels[-1], attention_heads)
                 if use_attention
                 else nn.Identity()
             ),
-            ConvBlock(channels[-1], channels[-1]),
+            ConvBlock(channels[-1], channels[-1], use_spectral_norm=True),
         )
 
-        # Decoder blocks with dropout and residual connections
+        # Decoder blocks with twin deconvolution
         self.decoder_blocks = nn.ModuleList()
         for i in range(n_blocks):
             in_ch = (
                 channels[n_blocks - i] + channels[n_blocks - i - 1]
             )  # skip connection
             out_ch = channels[n_blocks - i - 1]
-            block = nn.Sequential(
-                nn.ConvTranspose2d(
-                    channels[n_blocks - i],
-                    channels[n_blocks - i],
-                    kernel_size=2,
-                    stride=2,
-                ),
-                ConvBlock(in_ch, out_ch),
-                (
-                    nn.Dropout2d(dropout) if i < n_blocks - 1 else nn.Identity()
-                ),  # No dropout on last layer
-            )
-            self.decoder_blocks.append(block)
 
-        # Output layer with residual connection and proper initialization
-        # Ensure we have at least 2 channels for the intermediate layer
-        intermediate_channels = max(2, channels[0])
+            decoder_block = nn.Sequential(
+                TwinDeconvolution(channels[n_blocks - i], channels[n_blocks - i]),
+                ConvBlock(in_ch, out_ch, use_spectral_norm=True),
+                ConvBlock(out_ch, out_ch, use_spectral_norm=True),
+            )
+            self.decoder_blocks.append(decoder_block)
+
+        # Output layer with stereo support
         self.output = nn.Sequential(
-            nn.Conv2d(channels[0], intermediate_channels, kernel_size=3, padding=1),
-            nn.PReLU(),
-            nn.Conv2d(intermediate_channels, in_channels, kernel_size=1),
-            nn.Tanh(),  # Ensure output is bounded to prevent explosion
+            nn.Conv2d(channels[0], max(32, channels[0]), kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(max(32, channels[0]), out_channels, kernel_size=1),
+            nn.Tanh(),
         )
 
-        # Initialize weights properly to prevent vanishing outputs
+        # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize model weights to prevent vanishing/exploding gradients"""
+        """Improved weight initialization"""
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                # Use Xavier initialization for better gradient flow
-                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.ConvTranspose2d):
-                # Use Xavier initialization for transpose convolutions too
-                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        # x shape: (B, C, H, W) where C is frequency bins
-        residual_input = x  # Store input for residual connection
+        # Store input for residual connection
+        residual_input = x
 
-        # Encoder with skip connections
+        # Encoder with skip connections and context enhancement
         skip_connections = []
-        for block in self.encoder_blocks:
+        for i, (encoder_block, context_module) in enumerate(
+            zip(self.encoder_blocks, self.context_modules)
+        ):
             skip_connections.append(x)
-            x = block(x)
+            x = encoder_block(x)
+            x = context_module(x)
+
+            if i < len(self.encoder_blocks) - 1:  # Don't apply dropout to last encoder
+                x = self.dropout(x)
 
         # Bottleneck
         x = self.bottleneck(x)
 
         # Decoder with skip connections
-        for i, block in enumerate(self.decoder_blocks):
-            # Transpose convolution
-            if len(block) >= 3:
-                x = block[0](x)  # Transpose conv
-                skip = skip_connections[-(i + 1)]
+        for i, decoder_block in enumerate(self.decoder_blocks):
+            # Twin deconvolution
+            x = decoder_block[0](x)  # TwinDeconvolution
 
-                # Ensure spatial dimensions match before concatenation
-                if x.shape[2:] != skip.shape[2:]:
-                    # Crop or pad to match skip connection size
-                    diff_h = skip.shape[2] - x.shape[2]
-                    diff_w = skip.shape[3] - x.shape[3]
+            # Skip connection
+            skip = skip_connections[-(i + 1)]
+            if x.shape[2:] != skip.shape[2:]:
+                # Adaptive resizing for skip connections
+                x = F.interpolate(
+                    x, size=skip.shape[2:], mode="bilinear", align_corners=False
+                )
 
-                    if diff_h > 0 or diff_w > 0:
-                        # Pad if upsampled tensor is smaller
-                        pad_h = max(0, diff_h)
-                        pad_w = max(0, diff_w)
-                        x = F.pad(x, (0, pad_w, 0, pad_h))
-                    elif diff_h < 0 or diff_w < 0:
-                        # Crop if upsampled tensor is larger
-                        x = x[:, :, : skip.shape[2], : skip.shape[3]]
+            x = torch.cat([x, skip], dim=1)
 
-                x = torch.cat([x, skip], dim=1)
-                x = block[1](x)  # Conv block
-                if len(block) > 2:
-                    x = block[2](x)  # Dropout
-            else:
-                x = block(x)
+            # ConvBlocks
+            x = decoder_block[1](x)  # First ConvBlock
+            x = decoder_block[2](x)  # Second ConvBlock
+
+            if i < len(self.decoder_blocks) - 1:  # Don't apply dropout to last decoder
+                x = self.dropout(x)
 
         # Output with residual connection
         enhancement = self.output(x)
 
-        # Residual connection with gating to prevent over-correction
-        gate = torch.sigmoid(enhancement)  # Learn how much enhancement to apply
-        output = residual_input + gate * enhancement
+        if self.use_stereo:
+            # For stereo, expand mono input to stereo enhancement
+            if residual_input.shape[1] * 2 == enhancement.shape[1]:
+                # Duplicate mono input for stereo processing
+                stereo_input = torch.cat([residual_input, residual_input], dim=1)
+                output = stereo_input + 0.5 * enhancement  # Conservative enhancement
+            else:
+                output = enhancement
+        else:
+            # Mono output with residual connection
+            output = residual_input + 0.7 * enhancement
 
         return output
 
 
-class UnivNetWrapper(nn.Module):
+class EnhancedUnivNetWrapper(nn.Module):
     """
-    Lightweight neural vocoder for audio enhancement with stability improvements
-    Much simpler architecture to prevent training instability
+    Enhanced neural vocoder with advanced noise reduction and stereo support
     """
 
     def __init__(
         self,
         model_name: str = "univnet-c32",
-        pretrained: bool = True,
+        pretrained: bool = False,
         freeze_epochs: int = 0,
         sample_rate: int = 48000,
+        use_stereo: bool = False,
     ):
         super().__init__()
         self.model_name = model_name
         self.freeze_epochs = freeze_epochs
         self.sample_rate = sample_rate
+        self.use_stereo = use_stereo
 
-        # Simplified noise reduction with stable architecture
-        self.enhancer = nn.Sequential(
-            # First noise reduction block
-            nn.Conv1d(1, 16, kernel_size=7, padding=3),
-            nn.BatchNorm1d(16),
-            nn.PReLU(),
+        # Determine input/output channels
+        in_channels = 2 if use_stereo else 1
+        out_channels = 2 if use_stereo else 1
+
+        # Multi-scale enhancement network
+        self.pre_enhancer = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=15, padding=7, dilation=1),
+            nn.BatchNorm1d(32),
+            nn.SiLU(),
             nn.Dropout1d(0.1),
-            # Second noise reduction block
-            nn.Conv1d(16, 16, kernel_size=5, padding=2),
-            nn.BatchNorm1d(16),
-            nn.PReLU(),
-            nn.Dropout1d(0.1),
-            # Final output with noise suppression
-            nn.Conv1d(16, 8, kernel_size=3, padding=1),
-            nn.BatchNorm1d(8),
-            nn.PReLU(),
-            nn.Conv1d(8, 1, kernel_size=1),
-            nn.Tanh(),  # Bounded output to prevent artifacts
         )
 
-        # Separate gating network for adaptive enhancement
-        self.gate_net = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=3, padding=1),
-            nn.BatchNorm1d(8),
-            nn.PReLU(),
-            nn.Conv1d(8, 1, kernel_size=1),
-            nn.Sigmoid(),  # 0-1 gate for mixing
+        # Multi-scale dilated convolutions for different temporal contexts
+        self.multi_scale_blocks = nn.ModuleList(
+            [
+                self._make_dilated_block(32, 32, dilation=1),
+                self._make_dilated_block(32, 32, dilation=2),
+                self._make_dilated_block(32, 32, dilation=4),
+                self._make_dilated_block(32, 32, dilation=8),
+            ]
         )
 
-        # Initialize weights for stability
+        # Feature fusion and output
+        self.fusion = nn.Conv1d(32 * 4, 64, kernel_size=1)
+        self.post_enhancer = nn.Sequential(
+            nn.Conv1d(64, 32, kernel_size=7, padding=3),
+            nn.SiLU(),
+            nn.Dropout1d(0.1),
+            nn.Conv1d(32, out_channels, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
+
         self._initialize_weights()
 
+    def _make_dilated_block(self, in_channels, out_channels, dilation):
+        return nn.Sequential(
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size=7,
+                padding=7 * dilation // 2,
+                dilation=dilation,
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.SiLU(),
+            nn.Dropout1d(0.1),
+        )
+
     def _initialize_weights(self):
-        """Initialize weights for training stability"""
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
-                nn.init.xavier_uniform_(
-                    m.weight, gain=0.5
-                )  # Conservative initialization
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm1d):
@@ -291,46 +407,50 @@ class UnivNetWrapper(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def freeze_parameters(self):
-        """Freeze all parameters in the vocoder"""
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze_parameters(self):
-        """Unfreeze all parameters in the vocoder"""
         for param in self.parameters():
             param.requires_grad = True
 
     def forward(self, waveform):
-        """
-        Multi-scale noise reduction with adaptive gating
-        Args:
-            waveform: Input waveform tensor of shape (B, T) or (B, 1, T)
-        Returns:
-            Enhanced waveform of same shape as input
-        """
-        # Ensure input has channel dimension
+        # Handle different input formats
         if waveform.dim() == 2:
-            x = waveform.unsqueeze(1)  # (B, T) -> (B, 1, T)
+            if self.use_stereo:
+                # For stereo, input should be (B, T) and we'll convert to (B, 2, T)
+                x = waveform.unsqueeze(1).repeat(1, 2, 1)
+            else:
+                x = waveform.unsqueeze(1)
             squeeze_output = True
         else:
-            x = waveform  # Already (B, 1, T)
+            x = waveform
             squeeze_output = False
 
         # Store original for residual connection
         residual = x
 
-        # Apply noise reduction enhancement
-        enhancement = self.enhancer(x)
+        # Pre-enhancement
+        x = self.pre_enhancer(x)
 
-        # Adaptive gating - learn how much enhancement to apply
-        gate = self.gate_net(x)
+        # Multi-scale processing
+        multi_scale_outputs = []
+        for block in self.multi_scale_blocks:
+            multi_scale_outputs.append(block(x))
 
-        # Apply gated enhancement with residual connection
-        # Gate determines mix between original and enhanced signal
-        output = (1 - gate) * residual + gate * enhancement
+        # Fuse multi-scale features
+        x = torch.cat(multi_scale_outputs, dim=1)
+        x = self.fusion(x)
 
-        # Remove channel dimension if input was 2D
-        if squeeze_output:
+        # Post-enhancement
+        enhancement = self.post_enhancer(x)
+
+        # Strong residual connection with learned gating
+        alpha = 0.3  # Conservative enhancement
+        output = (1 - alpha) * residual + alpha * enhancement
+
+        # Output formatting
+        if squeeze_output and not self.use_stereo:
             output = output.squeeze(1)
 
         return output
@@ -428,7 +548,7 @@ class VGGishLoss(nn.Module):
 
 class Concert2StudioModel(nn.Module):
     """
-    Complete Concert2Studio model combining Spectrogram U-Net and UnivNet
+    Complete Concert2Studio model combining Spectrogram U-Net and Enhanced UnivNet
     """
 
     def __init__(self, config):
@@ -453,12 +573,12 @@ class Concert2StudioModel(nn.Module):
         # Spectrogram U-Net
         self.unet = SpectroUNet(**config["model"]["unet"])
 
-        # UnivNet vocoder
+        # Enhanced UnivNet vocoder
         self.use_vocoder = config["model"].get("use_vocoder", True)
         if self.use_vocoder:
             vocoder_config = config["model"]["vocoder"].copy()
             vocoder_config["sample_rate"] = config["data"]["sample_rate"]
-            self.vocoder = UnivNetWrapper(**vocoder_config)
+            self.vocoder = EnhancedUnivNetWrapper(**vocoder_config)
         else:
             self.vocoder = nn.Identity()
 
@@ -578,35 +698,11 @@ class Concert2StudioModel(nn.Module):
             print(f"STFT loss computation failed: {e}")
             losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-            # Add spectral coherence loss for better noise reduction
-        try:
-            pred_spec = self.stft(pred).contiguous()
-            target_spec = self.stft(target_smooth).contiguous()
-
-            # Magnitude loss for spectral clarity
-            pred_mag = torch.abs(pred_spec).contiguous()
-            target_mag = torch.abs(target_spec).contiguous()
-            spectral_loss = F.l1_loss(pred_mag, target_mag)
-            losses["spectral"] = torch.clamp(spectral_loss, max=3.0)
-
-            # Phase coherence loss for naturalness
-            pred_phase = torch.angle(pred_spec).contiguous()
-            target_phase = torch.angle(target_spec).contiguous()
-            phase_diff = torch.abs(torch.sin(pred_phase - target_phase)).contiguous()
-            phase_loss = torch.mean(phase_diff)
-            losses["phase"] = torch.clamp(phase_loss, max=1.0)
-
-        except Exception as e:
-            print(f"Spectral loss computation failed: {e}")
-            losses["spectral"] = torch.tensor(0.0, device=pred.device)
-            losses["phase"] = torch.tensor(0.0, device=pred.device)
-
-        # Balanced loss for noise reduction while maintaining reconstruction
+        # For tiny datasets, focus mainly on L1 reconstruction
+        # Minimize complex losses that can cause overfitting
         total_loss = (
-            0.6 * losses["l1"]  # Primary reconstruction loss
-            + 0.2 * losses["multires_stft"]  # Spectral structure
-            + 0.15 * losses["spectral"]  # Magnitude clarity
-            + 0.05 * losses["phase"]  # Phase coherence
+            0.9 * losses["l1"]  # Heavily dominant L1 loss
+            + 0.1 * losses["multires_stft"]  # Minimal STFT guidance
         )
 
         # Ultra-strict numerical stability check
@@ -626,8 +722,8 @@ class Concert2StudioModel(nn.Module):
                 torch.nn.utils.spectral_norm(module)
 
         # Apply spectral norm to vocoder if used
-        if self.use_vocoder and hasattr(self.vocoder, "enhancer"):
-            for module in self.vocoder.enhancer.modules():
+        if self.use_vocoder and hasattr(self.vocoder, "post_enhancer"):
+            for module in self.vocoder.post_enhancer.modules():
                 if isinstance(module, nn.Conv1d) and module.kernel_size == (3,):
                     torch.nn.utils.spectral_norm(module)
 

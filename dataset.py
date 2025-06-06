@@ -42,6 +42,16 @@ class ConcertDataset(Dataset):
         self.time_shift_ms = config["augmentation"]["time_shift_ms"]
         self.time_shift_prob = config["augmentation"]["time_shift_prob"]
 
+        # Advanced augmentation parameters (research-based)
+        self.mixup_prob = config["augmentation"].get("mixup_prob", 0.0)
+        self.mixup_alpha = config["augmentation"].get("mixup_alpha", 0.4)
+        self.spec_augment_prob = config["augmentation"].get("spec_augment_prob", 0.0)
+        self.freq_mask_prob = config["augmentation"].get("freq_mask_prob", 0.0)
+        self.time_mask_prob = config["augmentation"].get("time_mask_prob", 0.0)
+
+        # Stereo support
+        self.use_stereo = config["model"]["unet"].get("use_stereo", False)
+
         # Find all audio file pairs
         self.audio_pairs = self._find_audio_pairs()
 
@@ -101,23 +111,60 @@ class ConcertDataset(Dataset):
                     )
                     waveform = resampler(waveform)
 
-            # Convert to mono if stereo
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-
-            return waveform.squeeze(0)  # Remove channel dimension
+            # Handle stereo/mono based on configuration
+            if self.use_stereo:
+                # Ensure stereo output
+                if waveform.shape[0] == 1:
+                    # Duplicate mono to pseudo-stereo
+                    waveform = waveform.repeat(2, 1)
+                elif waveform.shape[0] > 2:
+                    # Take first two channels if more than stereo
+                    waveform = waveform[:2]
+                return waveform  # Keep (2, T) shape for stereo
+            else:
+                # Convert to mono if stereo
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                return waveform.squeeze(0)  # Remove channel dimension (T,)
 
         except Exception as e:
             # Fallback to librosa for problematic files
             warnings.warn(f"torchaudio failed for {file_path}, using librosa: {e}")
-            waveform, _ = librosa.load(file_path, sr=self.sample_rate, mono=True)
-            return torch.from_numpy(waveform)
+            if self.use_stereo:
+                # Load as stereo with librosa
+                waveform, _ = librosa.load(file_path, sr=self.sample_rate, mono=False)
+                waveform = torch.from_numpy(waveform)
+                if waveform.dim() == 1:  # Mono file
+                    waveform = waveform.unsqueeze(0).repeat(
+                        2, 1
+                    )  # Convert to pseudo-stereo
+                elif waveform.shape[0] > 2:
+                    waveform = waveform[:2]  # Take first two channels
+            else:
+                waveform, _ = librosa.load(file_path, sr=self.sample_rate, mono=True)
+                waveform = torch.from_numpy(waveform)
+            return waveform
 
     def _apply_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Apply data augmentation during training"""
+        """Apply data augmentation during training with research-based techniques"""
         if not self.is_training:
             return waveform
 
+        # Handle stereo vs mono
+        is_stereo_input = waveform.dim() == 2 and waveform.shape[0] == 2
+
+        # Apply augmentations to each channel if stereo
+        if is_stereo_input:
+            left_channel = self._apply_channel_augmentation(waveform[0])
+            right_channel = self._apply_channel_augmentation(waveform[1])
+            waveform = torch.stack([left_channel, right_channel], dim=0)
+        else:
+            waveform = self._apply_channel_augmentation(waveform)
+
+        return waveform
+
+    def _apply_channel_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Apply augmentation to a single channel"""
         # Gain jitter
         if random.random() < self.gain_jitter_prob:
             gain_db = random.uniform(-self.gain_jitter_db, self.gain_jitter_db)
@@ -160,20 +207,66 @@ class ConcertDataset(Dataset):
 
     def _get_random_segment(self, waveform: torch.Tensor) -> torch.Tensor:
         """Extract random segment of specified length"""
-        if len(waveform) <= self.segment_samples:
-            # Pad if too short
-            padding = self.segment_samples - len(waveform)
-            waveform = torch.nn.functional.pad(waveform, (0, padding))
-        else:
-            # Random crop if too long
-            if self.is_training:
-                start_idx = random.randint(0, len(waveform) - self.segment_samples)
+        # Handle stereo vs mono
+        if waveform.dim() == 2:  # Stereo (2, T)
+            waveform_length = waveform.shape[1]
+            if waveform_length <= self.segment_samples:
+                # Pad if too short
+                padding = self.segment_samples - waveform_length
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
             else:
-                # Use center crop for validation
-                start_idx = (len(waveform) - self.segment_samples) // 2
-            waveform = waveform[start_idx : start_idx + self.segment_samples]
+                # Random crop if too long
+                if self.is_training:
+                    start_idx = random.randint(
+                        0, waveform_length - self.segment_samples
+                    )
+                else:
+                    # Use center crop for validation
+                    start_idx = (waveform_length - self.segment_samples) // 2
+                waveform = waveform[:, start_idx : start_idx + self.segment_samples]
+        else:  # Mono (T,)
+            if len(waveform) <= self.segment_samples:
+                # Pad if too short
+                padding = self.segment_samples - len(waveform)
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+            else:
+                # Random crop if too long
+                if self.is_training:
+                    start_idx = random.randint(0, len(waveform) - self.segment_samples)
+                else:
+                    # Use center crop for validation
+                    start_idx = (len(waveform) - self.segment_samples) // 2
+                waveform = waveform[start_idx : start_idx + self.segment_samples]
 
         return waveform
+
+    def _apply_mixup(
+        self, concert_segment: torch.Tensor, studio_segment: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply mixup data augmentation"""
+        if not self.is_training or random.random() >= self.mixup_prob:
+            return concert_segment, studio_segment
+
+        # Get another random sample for mixing
+        mix_idx = random.randint(0, len(self.audio_pairs) - 1)
+        mix_concert_path, mix_studio_path = self.audio_pairs[mix_idx]
+
+        # Load the mixing samples
+        mix_concert = self._load_and_resample_audio(mix_concert_path)
+        mix_studio = self._load_and_resample_audio(mix_studio_path)
+
+        # Get segments
+        mix_concert_segment = self._get_random_segment(mix_concert)
+        mix_studio_segment = self._get_random_segment(mix_studio)
+
+        # Generate mixing coefficient
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+
+        # Mix the samples
+        mixed_concert = lam * concert_segment + (1 - lam) * mix_concert_segment
+        mixed_studio = lam * studio_segment + (1 - lam) * mix_studio_segment
+
+        return mixed_concert, mixed_studio
 
     def __len__(self) -> int:
         return len(self.audio_pairs)
@@ -196,6 +289,11 @@ class ConcertDataset(Dataset):
         # Apply augmentation
         concert_segment = self._apply_augmentation(concert_segment)
         studio_segment = self._apply_augmentation(studio_segment)
+
+        # Apply mixup augmentation
+        concert_segment, studio_segment = self._apply_mixup(
+            concert_segment, studio_segment
+        )
 
         # Normalize to prevent clipping
         concert_segment = torch.clamp(concert_segment, -1.0, 1.0)
