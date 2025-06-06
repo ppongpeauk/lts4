@@ -4,81 +4,73 @@
 # Data Configuration
 data:
   data_dir: "./data"
-  sample_rate: 44100  # Use 48kHz for better audio quality and noise reduction
+  sample_rate: 44000  # Standard rate for better compatibility
   bit_depth: 24
-  train_split: 0.8
-  val_split: 0.2
+  train_split: 0.9
+  val_split: 0.1
   random_seed: 42
-  use_synthetic: true  # Enable synthetic data for better generalization
+  use_synthetic: false  # Disable synthetic data to prevent overfitting
 
-# Audio Processing (optimized for 48kHz)
+# Audio Processing (reduced for small dataset)
 audio:
-  segment_length: 8.0  # Longer segments for better context
-  n_fft: 1024  # Larger FFT for better frequency resolution
-  hop_length: 256
-  win_length: 1024
+  segment_length: 2.0  # Shorter segments for small dataset
+  n_fft: 512  # Smaller FFT = fewer frequency bins
+  hop_length: 128
+  win_length: 512
   window: "hann"
 
 # Model Architecture
 model:
-  # Spectrogram U-Net (optimized for small dataset + stereo)
+  # Spectrogram U-Net (ultra-light for 19 samples)
   unet:
-    in_channels: 513  # Frequency bins for 1024 FFT (1024//2 + 1)
-    base_channels: 8  # Reduced capacity to prevent overfitting
-    max_channels: 64   # Much smaller capacity for tiny dataset
-    n_blocks: 3        # Fewer blocks to reduce complexity
-    dilations: [1, 2, 4]  # Simplified receptive fields
-    use_attention: false  # Disable attention to reduce overfitting
-    attention_heads: 2
-    dropout: 0.5  # Aggressive dropout for regularization
-    use_stereo: true  # Enable stereo processing
+    in_channels: 257  # Frequency bins for 512 FFT (512//2 + 1)
+    base_channels: 8  # Ultra-light for tiny dataset
+    max_channels: 64  # Ultra-light
+    n_blocks: 2  # Minimal architecture
+    dilations: [1, 2]  # Very simple
+    use_attention: false  # Disabled to reduce params
+    attention_heads: 1
+    dropout: 0.3  # Very strong regularization
 
-  # Enhanced UnivNet Vocoder (with noise reduction)
-  use_vocoder: true  # Keep vocoder for quality enhancement
+  # UnivNet Vocoder
+  use_vocoder: true  # Set to false to bypass vocoder for debugging
   vocoder:
     model_name: "univnet-c32"
-    pretrained: false  # Train from scratch for better fit
-    freeze_epochs: 25  # Freeze much longer to establish stable UNet first
-    use_stereo: true  # Enable stereo output
+    pretrained: true
+    freeze_epochs: 5
 
-# Training Configuration (anti-overfitting for tiny dataset)
+# Training Configuration (optimized for small dataset)
 training:
-  batch_size: 1  # Small but efficient batches
-  num_epochs: 50  # More training with better regularization
-  learning_rate: 5e-6  # Much more conservative for tiny dataset
-  weight_decay: 5e-3  # Increased L2 regularization to prevent overfitting
+  batch_size: 2  # Very small batches for tiny dataset
+  num_epochs: 30  # Reduced to prevent overfitting
+  learning_rate: 1e-4  # Conservative learning rate
+  weight_decay: 1e-2  # Strong regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
-  warmup_steps: 500  # Much longer warmup for stability
-  early_stopping_patience: 5  # Less patience to stop overfitting quickly
+  warmup_steps: 50  # Very short warmup
+  early_stopping_patience: 5  # Aggressive early stopping
   gradient_accumulation_steps: 4  # Effective batch size 8
-  max_grad_norm: 0.3  # Even stricter gradient clipping
-  scheduler: "linear"  # Linear decay instead of cosine for stability
+  max_grad_norm: 0.1  # Very aggressive gradient clipping
+  scheduler: "cosine"  # Cosine annealing for stability
 
 # Loss Configuration (simplified for stability)
 loss:
-  l1_weight: 1.0  # Focus primarily on L1 reconstruction
-  multires_stft_weight: 0.0  # Disable spectral loss initially for stability
+  l1_weight: 0.7  # Dominant reconstruction loss
+  multires_stft_weight: 0.2  # Reduced spectral loss
   vggish_weight: 0.0  # Disabled heavy perceptual loss
   adversarial_weight: 0.0  # Disabled for stability
 
   # Multi-resolution STFT scales (reduced for stability)
-  stft_scales: [256, 512, 1024]
+  stft_scales: [512, 1024, 2048]
 
-# Data Augmentation (aggressive anti-overfitting for tiny dataset)
+# Data Augmentation
 augmentation:
-  gain_jitter_db: 2.0  # Increased variation to improve generalization
-  gain_jitter_prob: 0.7  # Higher probability for more diversity
-  pink_noise_prob: 0.4  # More noise augmentation
-  pink_noise_level: -45  # Slightly more noticeable noise
-  time_shift_ms: 40  # More time variation
-  time_shift_prob: 0.6  # Higher probability
-  # Advanced augmentation techniques from research
-  mixup_prob: 0.3  # Enable mixup for better generalization
-  mixup_alpha: 0.3  # Moderate mixing
-  spec_augment_prob: 0.4  # Enable spectrogram augmentation
-  freq_mask_prob: 0.2
-  time_mask_prob: 0.2
+  gain_jitter_db: 3.0
+  gain_jitter_prob: 1.0
+  pink_noise_prob: 0.2
+  pink_noise_level: -40  # dB
+  time_shift_ms: 50
+  time_shift_prob: 0.8
 
 # Checkpointing and Logging
 checkpoint:
@@ -89,7 +81,7 @@ checkpoint:
 
 # Hardware Configuration
 hardware:
-  num_workers: 16
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
   compile_model: false  # Disabled to avoid CUDA compilation issues
