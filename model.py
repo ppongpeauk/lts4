@@ -345,8 +345,10 @@ class UnivNetWrapper(nn.Module):
         mf_features = self.enhancer["mf_path"](x)  # Mid-frequency enhancement
         lf_features = self.enhancer["lf_path"](x)  # Low-frequency preservation
 
-        # Concatenate multi-scale features
-        combined_features = torch.cat([hf_features, mf_features, lf_features], dim=1)
+        # Concatenate multi-scale features (ensure contiguous memory)
+        combined_features = torch.cat(
+            [hf_features, mf_features, lf_features], dim=1
+        ).contiguous()
 
         # Fuse features into enhancement signal
         enhancement = self.enhancer["fusion"](combined_features)
