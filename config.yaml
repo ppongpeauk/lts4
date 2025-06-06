@@ -23,7 +23,7 @@ audio:
 model:
   # Spectrogram U-Net
   unet:
-    in_channels: 513  # n_fft//2 + 1
+    in_channels: 1  # Single channel magnitude spectrogram
     base_channels: 32
     max_channels: 256
     n_blocks: 5

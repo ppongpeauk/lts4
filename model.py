@@ -333,8 +333,14 @@ class Concert2StudioModel(nn.Module):
         magnitude = torch.abs(spec)
         phase = torch.angle(spec)
 
+        # Add channel dimension for U-Net (expects 4D: batch, channels, freq, time)
+        magnitude_4d = magnitude.unsqueeze(1)  # (B, 1, freq, time)
+
         # Enhance magnitude with U-Net
-        enhanced_magnitude = self.unet(magnitude)
+        enhanced_magnitude_4d = self.unet(magnitude_4d)
+
+        # Remove channel dimension to match original spectrogram shape
+        enhanced_magnitude = enhanced_magnitude_4d.squeeze(1)  # (B, freq, time)
 
         # Reconstruct complex spectrogram
         enhanced_spec = enhanced_magnitude * torch.exp(1j * phase)
