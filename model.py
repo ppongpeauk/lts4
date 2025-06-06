@@ -153,6 +153,22 @@ class SpectroUNet(nn.Module):
         for i, block in enumerate(self.decoder_blocks):
             x = block[0](x)  # Transpose conv
             skip = skip_connections[-(i + 1)]
+
+            # Ensure spatial dimensions match before concatenation
+            if x.shape[2:] != skip.shape[2:]:
+                # Crop or pad to match skip connection size
+                diff_h = skip.shape[2] - x.shape[2]
+                diff_w = skip.shape[3] - x.shape[3]
+
+                if diff_h > 0 or diff_w > 0:
+                    # Pad if upsampled tensor is smaller
+                    pad_h = max(0, diff_h)
+                    pad_w = max(0, diff_w)
+                    x = F.pad(x, (0, pad_w, 0, pad_h))
+                elif diff_h < 0 or diff_w < 0:
+                    # Crop if upsampled tensor is larger
+                    x = x[:, :, : skip.shape[2], : skip.shape[3]]
+
             x = torch.cat([x, skip], dim=1)
             x = block[1](x)  # Conv block
 

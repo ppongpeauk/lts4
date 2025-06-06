@@ -26,9 +26,9 @@ model:
     in_channels: 1  # Single channel magnitude spectrogram
     base_channels: 32
     max_channels: 256
-    n_blocks: 5
+    n_blocks: 5  # Reduced from PRD's 6 to stay under 12M params
     dilations: [1, 2, 4, 8]
-    use_attention: false
+    use_attention: false  # Disabled to reduce params
     attention_heads: 1
 
   # UnivNet Vocoder
