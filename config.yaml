@@ -39,12 +39,12 @@ model:
     pretrained: true
     freeze_epochs: 5
 
-# Training Configuration (extreme settings for tiny dataset)
+# Training Configuration (balanced for noise reduction)
 training:
-  batch_size: 1  # Single sample batches
-  num_epochs: 20  # Very short training
-  learning_rate: 5e-5  # Very conservative learning rate
-  weight_decay: 5e-2  # Extreme regularization
+  batch_size: 2  # Small batches for stability
+  num_epochs: 30  # More epochs for better convergence
+  learning_rate: 1e-4  # Slightly higher for faster learning
+  weight_decay: 1e-2  # Moderate regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
   warmup_steps: 20  # Minimal warmup

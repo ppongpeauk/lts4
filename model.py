@@ -245,21 +245,54 @@ class UnivNetWrapper(nn.Module):
         self.freeze_epochs = freeze_epochs
         self.sample_rate = sample_rate
 
-        # Simplified single-path enhancement with strong residual connections
-        self.enhancer = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=7, padding=3, dilation=1),
-            nn.BatchNorm1d(16),
-            nn.PReLU(),
-            nn.Dropout1d(0.1),
-            nn.Conv1d(16, 16, kernel_size=7, padding=3, dilation=1),
-            nn.BatchNorm1d(16),
-            nn.PReLU(),
-            nn.Dropout1d(0.1),
-            nn.Conv1d(16, 8, kernel_size=5, padding=2),
-            nn.BatchNorm1d(8),
-            nn.PReLU(),
-            nn.Conv1d(8, 1, kernel_size=3, padding=1),
-            nn.Tanh(),  # Bounded output to prevent explosion
+        # Multi-scale noise reduction with gated residual connections
+        self.enhancer = nn.ModuleDict(
+            {
+                # High-frequency noise reduction path
+                "hf_path": nn.Sequential(
+                    nn.Conv1d(1, 8, kernel_size=3, padding=1, dilation=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                    nn.Conv1d(8, 8, kernel_size=3, padding=1, dilation=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                ),
+                # Mid-frequency enhancement path
+                "mf_path": nn.Sequential(
+                    nn.Conv1d(1, 8, kernel_size=5, padding=2, dilation=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                    nn.Conv1d(8, 8, kernel_size=5, padding=2, dilation=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                ),
+                # Low-frequency preservation path
+                "lf_path": nn.Sequential(
+                    nn.Conv1d(1, 8, kernel_size=7, padding=3, dilation=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                    nn.Conv1d(8, 8, kernel_size=7, padding=3, dilation=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                ),
+                # Fusion and output
+                "fusion": nn.Sequential(
+                    nn.Conv1d(24, 12, kernel_size=3, padding=1),
+                    nn.BatchNorm1d(12),
+                    nn.PReLU(),
+                    nn.Dropout1d(0.1),
+                    nn.Conv1d(12, 1, kernel_size=1),
+                    nn.Tanh(),  # Bounded output
+                ),
+                # Gating mechanism for adaptive mixing
+                "gate": nn.Sequential(
+                    nn.Conv1d(1, 8, kernel_size=3, padding=1),
+                    nn.BatchNorm1d(8),
+                    nn.PReLU(),
+                    nn.Conv1d(8, 1, kernel_size=1),
+                    nn.Sigmoid(),  # 0-1 gating
+                ),
+            }
         )
 
         # Initialize weights for stability
@@ -290,7 +323,7 @@ class UnivNetWrapper(nn.Module):
 
     def forward(self, waveform):
         """
-        Enhance waveform with strong residual connections for stability
+        Multi-scale noise reduction with adaptive gating
         Args:
             waveform: Input waveform tensor of shape (B, T) or (B, 1, T)
         Returns:
@@ -304,16 +337,26 @@ class UnivNetWrapper(nn.Module):
             x = waveform  # Already (B, 1, T)
             squeeze_output = False
 
-        # Store original for strong residual connection
+        # Store original for residual connection
         residual = x
 
-        # Apply enhancement with dropout during training
-        enhancement = self.enhancer(x)  # (B, 1, T)
+        # Multi-scale processing for different frequency ranges
+        hf_features = self.enhancer["hf_path"](x)  # High-frequency noise reduction
+        mf_features = self.enhancer["mf_path"](x)  # Mid-frequency enhancement
+        lf_features = self.enhancer["lf_path"](x)  # Low-frequency preservation
 
-        # Strong residual connection with conservative mixing
-        # Start with mostly input signal, gradually learn enhancements
-        alpha = 0.1  # Conservative enhancement mixing
-        output = (1 - alpha) * residual + alpha * enhancement
+        # Concatenate multi-scale features
+        combined_features = torch.cat([hf_features, mf_features, lf_features], dim=1)
+
+        # Fuse features into enhancement signal
+        enhancement = self.enhancer["fusion"](combined_features)
+
+        # Adaptive gating - learn how much enhancement to apply
+        gate = self.enhancer["gate"](x)
+
+        # Apply gated enhancement with residual connection
+        # Gate determines mix between original and enhanced signal
+        output = (1 - gate) * residual + gate * enhancement
 
         # Remove channel dimension if input was 2D
         if squeeze_output:
