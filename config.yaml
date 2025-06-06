@@ -43,10 +43,10 @@ model:
 
 # Training Configuration (anti-overfitting for tiny dataset)
 training:
-  batch_size: 2  # Small but efficient batches
+  batch_size: 1  # Small but efficient batches
   num_epochs: 50  # More training with better regularization
   learning_rate: 5e-6  # Much more conservative for tiny dataset
-  weight_decay: 1e-3  # Increased L2 regularization to prevent overfitting
+  weight_decay: 5e-3  # Increased L2 regularization to prevent overfitting
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
   warmup_steps: 500  # Much longer warmup for stability
