@@ -13,10 +13,10 @@ data:
 
 # Audio Processing (reduced for small dataset)
 audio:
-  segment_length: 2.0  # Shorter segments for small dataset
-  n_fft: 512  # Smaller FFT = fewer frequency bins
-  hop_length: 128
-  win_length: 512
+  segment_length: 1.0  # Shorter segments for small dataset
+  n_fft: 256  # Smaller FFT = fewer frequency bins
+  hop_length: 64
+  win_length: 256
   window: "hann"
 
 # Model Architecture
