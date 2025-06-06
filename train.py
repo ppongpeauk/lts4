@@ -133,21 +133,30 @@ class Trainer:
         """Create learning rate scheduler with warmup"""
         warmup_steps = int(self.config["training"]["warmup_steps"])
         total_steps = int(self.config["training"]["num_epochs"]) * 1000  # Estimate
+        scheduler_type = self.config["training"].get("scheduler", "cosine")
 
         # Linear warmup
         warmup_scheduler = LinearLR(
             self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps
         )
 
-        # Cosine annealing
-        cosine_scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6
-        )
+        # Main scheduler based on config
+        if scheduler_type == "linear":
+            main_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=1.0,
+                end_factor=0.1,
+                total_iters=total_steps - warmup_steps,
+            )
+        else:  # cosine
+            main_scheduler = CosineAnnealingLR(
+                self.optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6
+            )
 
         # Sequential scheduler
         self.scheduler = SequentialLR(
             self.optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
+            schedulers=[warmup_scheduler, main_scheduler],
             milestones=[warmup_steps],
         )
 
@@ -251,7 +260,8 @@ class Trainer:
 
         # Gradient clipping
         if self.accelerator.sync_gradients:
-            self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            max_norm = float(self.config["training"]["max_grad_norm"])
+            self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
 
         # Optimizer step
         self.optimizer.step()
@@ -420,12 +430,23 @@ def main():
 
     # Initialize accelerator
     # Determine mixed precision based on available hardware
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        mixed_precision = "bf16"
-    elif torch.cuda.is_available():
-        mixed_precision = "fp16"
+    mixed_precision = "no"  # Default to no mixed precision
+
+    if torch.cuda.is_available():
+        print(f"🚀 CUDA detected: {torch.cuda.get_device_name()}")
+        print(f"🚀 CUDA version: {torch.version.cuda}")
+        # Check for bfloat16 support on modern GPUs
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            mixed_precision = "bf16"
+            print("✅ Using bfloat16 mixed precision")
+        else:
+            mixed_precision = "fp16"
+            print("✅ Using float16 mixed precision")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("🍎 Apple Metal (MPS) detected")
+        mixed_precision = "no"  # MPS doesn't support mixed precision yet
     else:
-        mixed_precision = "no"  # CPU or MPS doesn't support mixed precision
+        print("💻 Using CPU")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=int(

@@ -24,13 +24,13 @@ model:
   # Spectrogram U-Net (optimized for small dataset + stereo)
   unet:
     in_channels: 513  # Frequency bins for 1024 FFT (1024//2 + 1)
-    base_channels: 16  # Increased capacity
-    max_channels: 128  # Reasonable capacity
-    n_blocks: 3  # More blocks for better learning
-    dilations: [1, 2, 4]  # Multi-scale receptive fields
-    use_attention: true  # Keep attention for better quality
+    base_channels: 12  # Reduced capacity to prevent overfitting
+    max_channels: 64   # Much smaller capacity for tiny dataset
+    n_blocks: 2        # Fewer blocks to reduce complexity
+    dilations: [1, 2]  # Simplified receptive fields
+    use_attention: false  # Disable attention to reduce overfitting
     attention_heads: 2
-    dropout: 0.3  # Moderate regularization
+    dropout: 0.5  # Aggressive dropout for regularization
     use_stereo: true  # Enable stereo processing
 
   # Enhanced UnivNet Vocoder (with noise reduction)
@@ -41,18 +41,18 @@ model:
     freeze_epochs: 15  # Freeze longer to establish stable UNet first
     use_stereo: true  # Enable stereo output
 
-# Training Configuration (research-optimized for small dataset)
+# Training Configuration (anti-overfitting for tiny dataset)
 training:
   batch_size: 2  # Small but efficient batches
   num_epochs: 50  # More training with better regularization
-  learning_rate: 2e-5  # Much lower learning rate for stability
-  weight_decay: 1e-4  # Reduced L2 regularization to prevent over-regularization
+  learning_rate: 5e-6  # Much more conservative for tiny dataset
+  weight_decay: 1e-3  # Increased L2 regularization to prevent overfitting
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
-  warmup_steps: 200  # Longer warmup for stability
-  early_stopping_patience: 15  # More patience with unstable training
+  warmup_steps: 500  # Much longer warmup for stability
+  early_stopping_patience: 5  # Less patience to stop overfitting quickly
   gradient_accumulation_steps: 4  # Effective batch size 8
-  max_grad_norm: 0.5  # Stricter gradient clipping
+  max_grad_norm: 0.3  # Even stricter gradient clipping
   scheduler: "linear"  # Linear decay instead of cosine for stability
 
 # Loss Configuration (simplified for stability)
@@ -65,20 +65,20 @@ loss:
   # Multi-resolution STFT scales (reduced for stability)
   stft_scales: [512, 1024, 2048]
 
-# Data Augmentation (research-based for small datasets)
+# Data Augmentation (aggressive anti-overfitting for tiny dataset)
 augmentation:
-  gain_jitter_db: 1.0  # Much reduced variation for stability
-  gain_jitter_prob: 0.3  # Reduced probability
-  pink_noise_prob: 0.1  # Minimal noise augmentation
-  pink_noise_level: -50  # Even more subtle noise injection
-  time_shift_ms: 20  # Reduced time variation
-  time_shift_prob: 0.3  # Reduced probability
+  gain_jitter_db: 2.0  # Increased variation to improve generalization
+  gain_jitter_prob: 0.7  # Higher probability for more diversity
+  pink_noise_prob: 0.4  # More noise augmentation
+  pink_noise_level: -45  # Slightly more noticeable noise
+  time_shift_ms: 40  # More time variation
+  time_shift_prob: 0.6  # Higher probability
   # Advanced augmentation techniques from research
-  mixup_prob: 0.0  # Disable mixup initially for stability
-  mixup_alpha: 0.2  # Reduced mixing if enabled
-  spec_augment_prob: 0.0  # Disable spectrogram augmentation initially
-  freq_mask_prob: 0.1
-  time_mask_prob: 0.1
+  mixup_prob: 0.3  # Enable mixup for better generalization
+  mixup_alpha: 0.3  # Moderate mixing
+  spec_augment_prob: 0.4  # Enable spectrogram augmentation
+  freq_mask_prob: 0.2
+  time_mask_prob: 0.2
 
 # Checkpointing and Logging
 checkpoint:
