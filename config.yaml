@@ -11,13 +11,13 @@ data:
   random_seed: 42
   use_synthetic: true  # Enable synthetic data for better generalization
 
-  # Audio Processing (optimized for 48kHz)
-  audio:
-    segment_length: 2.0  # Longer segments for better context
-    n_fft: 1024  # Larger FFT for better frequency resolution
-    hop_length: 256
-    win_length: 1024
-    window: "hann"
+# Audio Processing (optimized for 48kHz)
+audio:
+  segment_length: 2.0  # Longer segments for better context
+  n_fft: 1024  # Larger FFT for better frequency resolution
+  hop_length: 256
+  win_length: 1024
+  window: "hann"
 
 # Model Architecture
 model:
