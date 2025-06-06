@@ -11,26 +11,26 @@ data:
   random_seed: 42
   use_synthetic: false  # Disable synthetic data to prevent overfitting
 
-# Audio Processing
+# Audio Processing (reduced for small dataset)
 audio:
-  segment_length: 4.0  # seconds
-  n_fft: 1024
-  hop_length: 256
-  win_length: 1024
+  segment_length: 2.0  # Shorter segments for small dataset
+  n_fft: 512  # Smaller FFT = fewer frequency bins
+  hop_length: 128
+  win_length: 512
   window: "hann"
 
 # Model Architecture
 model:
-  # Spectrogram U-Net (optimized for 16 samples)
+  # Spectrogram U-Net (ultra-light for 19 samples)
   unet:
-    in_channels: 513  # Frequency bins for 1024 FFT
-    base_channels: 16  # Heavily reduced for small dataset
-    max_channels: 128  # Heavily reduced
-    n_blocks: 3  # Minimal architecture
-    dilations: [1, 2, 4]  # Simplified
+    in_channels: 257  # Frequency bins for 512 FFT (512//2 + 1)
+    base_channels: 8  # Ultra-light for tiny dataset
+    max_channels: 64  # Ultra-light
+    n_blocks: 2  # Minimal architecture
+    dilations: [1, 2]  # Very simple
     use_attention: false  # Disabled to reduce params
     attention_heads: 1
-    dropout: 0.2  # Strong regularization
+    dropout: 0.3  # Very strong regularization
 
   # UnivNet Vocoder
   use_vocoder: true  # Set to false to bypass vocoder for debugging
@@ -41,16 +41,17 @@ model:
 
 # Training Configuration (optimized for small dataset)
 training:
-  batch_size: 4  # Smaller batches for better generalization
-  num_epochs: 50  # Reduced to prevent overfitting
-  learning_rate: 5e-5  # Much lower learning rate for stability
+  batch_size: 2  # Very small batches for tiny dataset
+  num_epochs: 30  # Reduced to prevent overfitting
+  learning_rate: 1e-4  # Conservative learning rate
   weight_decay: 1e-2  # Strong regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
-  warmup_steps: 100  # Shorter warmup for small dataset
-  early_stopping_patience: 8  # Earlier stopping
-  gradient_accumulation_steps: 2  # Effective batch size 8
-  max_grad_norm: 0.5  # Gradient clipping
+  warmup_steps: 50  # Very short warmup
+  early_stopping_patience: 5  # Aggressive early stopping
+  gradient_accumulation_steps: 4  # Effective batch size 8
+  max_grad_norm: 0.1  # Very aggressive gradient clipping
+  scheduler: "cosine"  # Cosine annealing for stability
 
 # Loss Configuration (simplified for stability)
 loss:
