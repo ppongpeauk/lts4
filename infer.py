@@ -94,10 +94,27 @@ class AudioInferencer:
             # Load audio
             waveform, orig_sr = torchaudio.load(file_path)
 
-            # Convert to mono if stereo
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-                print("🔄 Converted to mono")
+            # Handle stereo/mono based on model configuration
+            use_stereo = self.config["model"]["unet"].get("use_stereo", False)
+
+            if use_stereo:
+                # Keep stereo or convert mono to stereo
+                if waveform.shape[0] == 1:
+                    # Duplicate mono to stereo
+                    waveform = waveform.repeat(2, 1)
+                    print("🔄 Converted mono to stereo")
+                elif waveform.shape[0] > 2:
+                    # Take first two channels if more than stereo
+                    waveform = waveform[:2]
+                    print("🔄 Trimmed to stereo")
+                # Keep as (2, T) for stereo processing
+            else:
+                # Convert to mono if stereo
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                    print("🔄 Converted to mono")
+                # Remove channel dimension for mono: (1, T) -> (T,)
+                waveform = waveform.squeeze(0)
 
             # Resample if necessary
             if orig_sr != self.sample_rate:
@@ -105,10 +122,14 @@ class AudioInferencer:
                 resampler = torchaudio.transforms.Resample(
                     orig_freq=orig_sr, new_freq=self.sample_rate
                 )
-                waveform = resampler(waveform)
-
-            # Remove channel dimension
-            waveform = waveform.squeeze(0)
+                if use_stereo:
+                    # Resample each channel separately
+                    resampled_channels = []
+                    for ch in range(waveform.shape[0]):
+                        resampled_channels.append(resampler(waveform[ch : ch + 1]))
+                    waveform = torch.cat(resampled_channels, dim=0)
+                else:
+                    waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
 
             # Normalize
             if torch.max(torch.abs(waveform)) > 1.0:
@@ -125,32 +146,71 @@ class AudioInferencer:
 
     def _apply_window(self, segment: torch.Tensor) -> torch.Tensor:
         """Apply Hann window to segment edges for smooth overlap-add"""
-        if len(segment) != self.segment_samples:
-            return segment
+        use_stereo = self.config["model"]["unet"].get("use_stereo", False)
 
-        # Create Hann window for overlap regions
-        window = torch.ones_like(segment)
+        if use_stereo:
+            # Stereo: segment shape is (2, T)
+            if segment.shape[-1] != self.segment_samples:
+                return segment
 
-        # Fade in
-        fade_in = torch.hann_window(2 * self.overlap_samples)[: self.overlap_samples]
-        window[: self.overlap_samples] = fade_in
+            # Create Hann window for overlap regions
+            window = torch.ones_like(segment)
 
-        # Fade out
-        fade_out = torch.hann_window(2 * self.overlap_samples)[self.overlap_samples :]
-        window[-self.overlap_samples :] = fade_out
+            # Fade in
+            fade_in = torch.hann_window(2 * self.overlap_samples)[
+                : self.overlap_samples
+            ]
+            window[:, : self.overlap_samples] = fade_in.unsqueeze(0)
+
+            # Fade out
+            fade_out = torch.hann_window(2 * self.overlap_samples)[
+                self.overlap_samples :
+            ]
+            window[:, -self.overlap_samples :] = fade_out.unsqueeze(0)
+        else:
+            # Mono: segment shape is (T,)
+            if len(segment) != self.segment_samples:
+                return segment
+
+            # Create Hann window for overlap regions
+            window = torch.ones_like(segment)
+
+            # Fade in
+            fade_in = torch.hann_window(2 * self.overlap_samples)[
+                : self.overlap_samples
+            ]
+            window[: self.overlap_samples] = fade_in
+
+            # Fade out
+            fade_out = torch.hann_window(2 * self.overlap_samples)[
+                self.overlap_samples :
+            ]
+            window[-self.overlap_samples :] = fade_out
 
         return segment * window
 
     def _process_segment(self, segment: torch.Tensor) -> torch.Tensor:
         """Process a single audio segment"""
-        # Pad if necessary
-        original_length = len(segment)
-        if original_length < self.segment_samples:
-            padding = self.segment_samples - original_length
-            segment = torch.nn.functional.pad(segment, (0, padding))
+        use_stereo = self.config["model"]["unet"].get("use_stereo", False)
 
-        # Add batch dimension and move to device
-        segment = segment.unsqueeze(0).to(self.device)
+        if use_stereo:
+            # Stereo processing: segment shape is (2, T)
+            original_length = segment.shape[-1]
+            if original_length < self.segment_samples:
+                padding = self.segment_samples - original_length
+                segment = torch.nn.functional.pad(segment, (0, padding))
+
+            # Add batch dimension: (2, T) -> (1, 2, T)
+            segment = segment.unsqueeze(0).to(self.device)
+        else:
+            # Mono processing: segment shape is (T,)
+            original_length = len(segment)
+            if original_length < self.segment_samples:
+                padding = self.segment_samples - original_length
+                segment = torch.nn.functional.pad(segment, (0, padding))
+
+            # Add batch dimension: (T,) -> (1, T)
+            segment = segment.unsqueeze(0).to(self.device)
 
         # Set memory format if requested
         if self.config.get("hardware", {}).get("channels_last", False):
@@ -164,8 +224,14 @@ class AudioInferencer:
         enhanced = enhanced.cpu().squeeze(0)
 
         # Trim to original length if padded
-        if original_length < self.segment_samples:
-            enhanced = enhanced[:original_length]
+        if use_stereo:
+            # Stereo: enhanced shape is (2, T)
+            if original_length < self.segment_samples:
+                enhanced = enhanced[..., :original_length]
+        else:
+            # Mono: enhanced shape is (T,)
+            if original_length < self.segment_samples:
+                enhanced = enhanced[:original_length]
 
         return enhanced
 
@@ -173,7 +239,14 @@ class AudioInferencer:
         self, input_audio: torch.Tensor, show_progress: bool = True
     ) -> torch.Tensor:
         """Process full audio with overlap-add"""
-        total_samples = len(input_audio)
+        use_stereo = self.config["model"]["unet"].get("use_stereo", False)
+
+        if use_stereo:
+            # Stereo processing: input_audio shape is (2, T)
+            total_samples = input_audio.shape[-1]
+        else:
+            # Mono processing: input_audio shape is (T,)
+            total_samples = len(input_audio)
 
         if total_samples <= self.segment_samples:
             # Audio is short enough to process in one go
@@ -187,8 +260,12 @@ class AudioInferencer:
         print(f"🎵 Processing {num_segments} overlapping segments")
 
         # Initialize output
-        output_audio = torch.zeros(total_samples)
-        overlap_counts = torch.zeros(total_samples)
+        if use_stereo:
+            output_audio = torch.zeros(2, total_samples)
+            overlap_counts = torch.zeros(2, total_samples)
+        else:
+            output_audio = torch.zeros(total_samples)
+            overlap_counts = torch.zeros(total_samples)
 
         # Process segments with overlap-add
         for i in range(num_segments):
@@ -203,7 +280,10 @@ class AudioInferencer:
                 )
 
             # Extract segment
-            segment = input_audio[start_idx:end_idx]
+            if use_stereo:
+                segment = input_audio[:, start_idx:end_idx]  # (2, segment_length)
+            else:
+                segment = input_audio[start_idx:end_idx]  # (segment_length,)
 
             # Process segment
             enhanced_segment = self._process_segment(segment)
@@ -213,9 +293,16 @@ class AudioInferencer:
                 enhanced_segment = self._apply_window(enhanced_segment)
 
             # Add to output with overlap handling
-            actual_length = len(enhanced_segment)
-            output_audio[start_idx : start_idx + actual_length] += enhanced_segment
-            overlap_counts[start_idx : start_idx + actual_length] += 1
+            if use_stereo:
+                actual_length = enhanced_segment.shape[-1]
+                output_audio[
+                    :, start_idx : start_idx + actual_length
+                ] += enhanced_segment
+                overlap_counts[:, start_idx : start_idx + actual_length] += 1
+            else:
+                actual_length = len(enhanced_segment)
+                output_audio[start_idx : start_idx + actual_length] += enhanced_segment
+                overlap_counts[start_idx : start_idx + actual_length] += 1
 
         if show_progress:
             print()  # New line after progress
@@ -277,7 +364,14 @@ class AudioInferencer:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         # Convert to numpy and ensure correct format
-        audio_np = audio.numpy().astype(np.float32)
+        use_stereo = self.config["model"]["unet"].get("use_stereo", False)
+
+        if use_stereo:
+            # Stereo: audio shape is (2, T) -> transpose to (T, 2) for soundfile
+            audio_np = audio.transpose(0, 1).numpy().astype(np.float32)
+        else:
+            # Mono: audio shape is (T,)
+            audio_np = audio.numpy().astype(np.float32)
 
         # Clamp to prevent clipping
         audio_np = np.clip(audio_np, -1.0, 1.0)
