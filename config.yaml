@@ -77,7 +77,7 @@ checkpoint:
 
 # Hardware Configuration
 hardware:
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
   compile_model: false  # Disabled to avoid CUDA compilation issues
