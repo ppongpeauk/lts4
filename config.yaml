@@ -11,46 +11,46 @@ data:
   random_seed: 42
   use_synthetic: false  # Disable synthetic data to prevent overfitting
 
-# Audio Processing (reduced for small dataset)
+# Audio Processing (extreme reduction for tiny dataset)
 audio:
-  segment_length: 2.0  # Shorter segments for small dataset
-  n_fft: 512  # Smaller FFT = fewer frequency bins
-  hop_length: 128
-  win_length: 512
+  segment_length: 1.0  # Very short segments for more samples
+  n_fft: 256  # Very small FFT = minimal frequency bins
+  hop_length: 64
+  win_length: 256
   window: "hann"
 
 # Model Architecture
 model:
-  # Spectrogram U-Net (ultra-light for 19 samples)
+  # Spectrogram U-Net (minimal for 19 samples)
   unet:
-    in_channels: 257  # Frequency bins for 512 FFT (512//2 + 1)
-    base_channels: 8  # Ultra-light for tiny dataset
-    max_channels: 64  # Ultra-light
-    n_blocks: 2  # Minimal architecture
-    dilations: [1, 2]  # Very simple
+    in_channels: 129  # Frequency bins for 256 FFT (256//2 + 1)
+    base_channels: 4  # Extreme reduction for tiny dataset
+    max_channels: 16  # Extreme reduction
+    n_blocks: 1  # Single block only
+    dilations: [1]  # No dilation
     use_attention: false  # Disabled to reduce params
     attention_heads: 1
-    dropout: 0.3  # Very strong regularization
+    dropout: 0.5  # Extreme regularization
 
-  # UnivNet Vocoder
-  use_vocoder: true  # Set to false to bypass vocoder for debugging
+  # UnivNet Vocoder (disabled for stability)
+  use_vocoder: false  # Disabled to prevent overfitting
   vocoder:
     model_name: "univnet-c32"
     pretrained: true
     freeze_epochs: 5
 
-# Training Configuration (optimized for small dataset)
+# Training Configuration (extreme settings for tiny dataset)
 training:
-  batch_size: 2  # Very small batches for tiny dataset
-  num_epochs: 30  # Reduced to prevent overfitting
-  learning_rate: 1e-4  # Conservative learning rate
-  weight_decay: 1e-2  # Strong regularization
+  batch_size: 1  # Single sample batches
+  num_epochs: 20  # Very short training
+  learning_rate: 5e-5  # Very conservative learning rate
+  weight_decay: 5e-2  # Extreme regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
-  warmup_steps: 50  # Very short warmup
-  early_stopping_patience: 5  # Aggressive early stopping
-  gradient_accumulation_steps: 4  # Effective batch size 8
-  max_grad_norm: 0.1  # Very aggressive gradient clipping
+  warmup_steps: 20  # Minimal warmup
+  early_stopping_patience: 3  # Very aggressive early stopping
+  gradient_accumulation_steps: 8  # Effective batch size 8
+  max_grad_norm: 0.05  # Extreme gradient clipping
   scheduler: "cosine"  # Cosine annealing for stability
 
 # Loss Configuration (simplified for stability)
@@ -63,14 +63,14 @@ loss:
   # Multi-resolution STFT scales (reduced for stability)
   stft_scales: [512, 1024, 2048]
 
-# Data Augmentation
+# Data Augmentation (aggressive for tiny dataset)
 augmentation:
-  gain_jitter_db: 3.0
+  gain_jitter_db: 6.0  # Increased variation
   gain_jitter_prob: 1.0
-  pink_noise_prob: 0.2
-  pink_noise_level: -40  # dB
-  time_shift_ms: 50
-  time_shift_prob: 0.8
+  pink_noise_prob: 0.5  # More noise augmentation
+  pink_noise_level: -35  # Slightly more noise
+  time_shift_ms: 100  # More time variation
+  time_shift_prob: 1.0  # Always apply
 
 # Checkpointing and Logging
 checkpoint:
