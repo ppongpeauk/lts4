@@ -10,7 +10,6 @@ import torchaudio
 from typing import List, Tuple, Optional
 import math
 from auraloss.freq import MultiResolutionSTFTLoss
-from huggingface_hub import hf_hub_download
 
 
 class ConvBlock(nn.Module):
@@ -143,10 +142,12 @@ class SpectroUNet(nn.Module):
             self.decoder_blocks.append(block)
 
         # Output layer with residual connection and proper initialization
+        # Ensure we have at least 2 channels for the intermediate layer
+        intermediate_channels = max(2, channels[0])
         self.output = nn.Sequential(
-            nn.Conv2d(channels[0], channels[0] // 2, kernel_size=3, padding=1),
+            nn.Conv2d(channels[0], intermediate_channels, kernel_size=3, padding=1),
             nn.PReLU(),
-            nn.Conv2d(channels[0] // 2, in_channels, kernel_size=1),
+            nn.Conv2d(intermediate_channels, in_channels, kernel_size=1),
             nn.Tanh(),  # Ensure output is bounded to prevent explosion
         )
 
@@ -474,14 +475,16 @@ class Concert2StudioModel(nn.Module):
         magnitude = torch.abs(spec)
         phase = torch.angle(spec)
 
-        # Add channel dimension for U-Net (expects 4D: batch, channels, freq, time)
-        magnitude_4d = magnitude.unsqueeze(1)  # (B, 1, freq, time)
+        # Reshape for U-Net: treat frequency bins as channels
+        # (B, freq, time) -> (B, freq, 1, time)
+        magnitude_4d = magnitude.unsqueeze(2)  # (B, freq, 1, time)
 
         # Enhance magnitude with U-Net
         enhanced_magnitude_4d = self.unet(magnitude_4d)
 
-        # Remove channel dimension to match original spectrogram shape
-        enhanced_magnitude = enhanced_magnitude_4d.squeeze(1)  # (B, freq, time)
+        # Reshape back to original spectrogram shape
+        # (B, freq, 1, time) -> (B, freq, time)
+        enhanced_magnitude = enhanced_magnitude_4d.squeeze(2)
 
         # Reconstruct complex spectrogram
         enhanced_spec = enhanced_magnitude * torch.exp(1j * phase)

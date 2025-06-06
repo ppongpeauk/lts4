@@ -23,7 +23,7 @@ audio:
 model:
   # Spectrogram U-Net (optimized for 16 samples)
   unet:
-    in_channels: 1  # Single channel magnitude spectrogram
+    in_channels: 513  # Frequency bins for 1024 FFT
     base_channels: 16  # Heavily reduced for small dataset
     max_channels: 128  # Heavily reduced
     n_blocks: 3  # Minimal architecture
