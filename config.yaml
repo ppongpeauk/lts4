@@ -24,8 +24,8 @@ model:
   # Spectrogram U-Net (optimized for small dataset + stereo)
   unet:
     in_channels: 513  # Frequency bins for 1024 FFT (1024//2 + 1)
-    base_channels: 8  # Increased capacity
-    max_channels: 64  # Reasonable capacity
+    base_channels: 16  # Increased capacity
+    max_channels: 128  # Reasonable capacity
     n_blocks: 3  # More blocks for better learning
     dilations: [1, 2, 4]  # Multi-scale receptive fields
     use_attention: true  # Keep attention for better quality
@@ -45,8 +45,8 @@ model:
 training:
   batch_size: 1  # Small but efficient batches
   num_epochs: 50  # More training with better regularization
-  learning_rate: 5e-5  # Standard learning rate
-  weight_decay: 1e-4  # Moderate L2 regularization
+  learning_rate: 1e-4  # Standard learning rate
+  weight_decay: 1e-3  # Moderate L2 regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
   warmup_steps: 100  # Proper warmup for stability
