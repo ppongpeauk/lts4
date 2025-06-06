@@ -310,6 +310,22 @@ class Trainer:
         for epoch in range(self.current_epoch, self.config["training"]["num_epochs"]):
             self.current_epoch = epoch
 
+            # Handle vocoder freezing/unfreezing
+            freeze_epochs = self.config["model"]["vocoder"].get("freeze_epochs", 0)
+            if freeze_epochs > 0:
+                if epoch < freeze_epochs:
+                    if self.accelerator.is_main_process and epoch == 0:
+                        print(f"🔒 Freezing vocoder for first {freeze_epochs} epochs")
+                    # Access the actual model through accelerator wrapper
+                    actual_model = self.accelerator.unwrap_model(self.model)
+                    actual_model.vocoder.freeze_parameters()
+                elif epoch == freeze_epochs:
+                    if self.accelerator.is_main_process:
+                        print(f"🔓 Unfreezing vocoder at epoch {epoch+1}")
+                    # Access the actual model through accelerator wrapper
+                    actual_model = self.accelerator.unwrap_model(self.model)
+                    actual_model.vocoder.unfreeze_parameters()
+
             # Training phase
             self.model.train()
             epoch_losses = []

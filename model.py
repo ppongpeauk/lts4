@@ -167,9 +167,15 @@ class UnivNetWrapper(nn.Module):
     Downloads pretrained weights from Hugging Face Hub
     """
 
-    def __init__(self, model_name: str = "univnet-c32", pretrained: bool = True):
+    def __init__(
+        self,
+        model_name: str = "univnet-c32",
+        pretrained: bool = True,
+        freeze_epochs: int = 0,
+    ):
         super().__init__()
         self.model_name = model_name
+        self.freeze_epochs = freeze_epochs
 
         # Placeholder for actual UnivNet implementation
         # In practice, you would load the actual UnivNet model here
@@ -204,6 +210,16 @@ class UnivNetWrapper(nn.Module):
             print("Pretrained weights loaded successfully")
         except Exception as e:
             print(f"Warning: Could not load pretrained weights: {e}")
+
+    def freeze_parameters(self):
+        """Freeze all parameters in the vocoder"""
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def unfreeze_parameters(self):
+        """Unfreeze all parameters in the vocoder"""
+        for param in self.parameters():
+            param.requires_grad = True
 
     def forward(self, spectrogram):
         # Convert spectrogram to mel-spectrogram
