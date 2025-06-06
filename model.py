@@ -689,11 +689,23 @@ class Concert2StudioModel(nn.Module):
                 pad_length = waveform.shape[-1] - enhanced_waveform.shape[-1]
                 enhanced_waveform = F.pad(enhanced_waveform, (0, pad_length))
 
+        # Check for NaN/Inf values and clamp enhanced waveform
+        if torch.isnan(enhanced_waveform).any() or torch.isinf(enhanced_waveform).any():
+            print("Warning: NaN/Inf detected in enhanced waveform, clamping values")
+            enhanced_waveform = torch.clamp(enhanced_waveform, -1.0, 1.0)
+
         # Apply vocoder for final audio enhancement and noise reduction
         if self.use_vocoder:
             final_waveform = self.vocoder(enhanced_waveform)
+
+            # Check for NaN/Inf in vocoder output
+            if torch.isnan(final_waveform).any() or torch.isinf(final_waveform).any():
+                print(
+                    "Warning: NaN/Inf detected in vocoder output, falling back to enhanced waveform"
+                )
+                final_waveform = enhanced_waveform
             # Debug: Check for silent output
-            if torch.allclose(
+            elif torch.allclose(
                 final_waveform, torch.zeros_like(final_waveform), atol=1e-6
             ):
                 print(
@@ -702,6 +714,9 @@ class Concert2StudioModel(nn.Module):
                 final_waveform = enhanced_waveform
         else:
             final_waveform = enhanced_waveform
+
+        # Final safety clamp
+        final_waveform = torch.clamp(final_waveform, -1.0, 1.0)
 
         # Ensure final output length matches input length
         if final_waveform.shape[-1] != waveform.shape[-1]:
@@ -724,16 +739,20 @@ class Concert2StudioModel(nn.Module):
         """Calculate combined loss optimized for tiny datasets with extreme stability"""
         losses = {}
 
-        # Add noise to target for label smoothing (prevents overfitting)
+        # Clamp inputs to prevent extreme values
+        pred = torch.clamp(pred, -10.0, 10.0)
+        target = torch.clamp(target, -10.0, 10.0)
+
+        # Add minimal noise to target for label smoothing (prevents overfitting)
         if self.training:
-            noise_scale = 0.01  # Very small noise
+            noise_scale = 0.001  # Much smaller noise for stability
             target_smooth = target + torch.randn_like(target) * noise_scale
         else:
             target_smooth = target
 
         # L1 loss (primary reconstruction loss) with label smoothing
         l1_loss = self.l1_loss(pred, target_smooth)
-        losses["l1"] = torch.clamp(l1_loss, max=2.0)  # Even more conservative
+        losses["l1"] = torch.clamp(l1_loss, max=1.0)  # More conservative clamping
 
         # Add channel dimension for auraloss (expects 3D: batch, channels, time)
         if pred.dim() == 2:  # Mono: (B, T) -> (B, 1, T)
@@ -753,17 +772,24 @@ class Concert2StudioModel(nn.Module):
             print(f"STFT loss computation failed: {e}")
             losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-        # For tiny datasets, focus mainly on L1 reconstruction
-        # Minimize complex losses that can cause overfitting
+        # Use configured loss weights
         total_loss = (
-            0.9 * losses["l1"]  # Heavily dominant L1 loss
-            + 0.1 * losses["multires_stft"]  # Minimal STFT guidance
+            self.loss_weights["l1"] * losses["l1"]
+            + self.loss_weights["multires_stft"] * losses["multires_stft"]
+            + self.loss_weights["vggish"]
+            * losses.get("vggish", torch.tensor(0.0, device=pred.device))
         )
 
         # Ultra-strict numerical stability check
-        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 50.0:
-            print("Warning: Unstable loss detected, falling back to L1 only")
+        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 5.0:
+            print(
+                f"Warning: Unstable loss detected ({total_loss}), falling back to L1 only"
+            )
             total_loss = losses["l1"]
+            # If L1 is also unstable, use a small constant
+            if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 5.0:
+                print("Warning: L1 loss also unstable, using fallback loss")
+                total_loss = torch.tensor(1.0, device=pred.device)
 
         losses["total"] = total_loss
         return losses
