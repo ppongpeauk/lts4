@@ -364,8 +364,28 @@ class Concert2StudioModel(nn.Module):
         # Convert back to waveform
         enhanced_waveform = self.istft(enhanced_spec)
 
+        # Ensure output length matches input length
+        if enhanced_waveform.shape[-1] != waveform.shape[-1]:
+            if enhanced_waveform.shape[-1] > waveform.shape[-1]:
+                # Trim if output is longer
+                enhanced_waveform = enhanced_waveform[..., : waveform.shape[-1]]
+            else:
+                # Pad if output is shorter
+                pad_length = waveform.shape[-1] - enhanced_waveform.shape[-1]
+                enhanced_waveform = F.pad(enhanced_waveform, (0, pad_length))
+
         # Further enhance with vocoder
         final_waveform = self.vocoder(enhanced_waveform)
+
+        # Ensure final output length matches input length
+        if final_waveform.shape[-1] != waveform.shape[-1]:
+            if final_waveform.shape[-1] > waveform.shape[-1]:
+                # Trim if output is longer
+                final_waveform = final_waveform[..., : waveform.shape[-1]]
+            else:
+                # Pad if output is shorter
+                pad_length = waveform.shape[-1] - final_waveform.shape[-1]
+                final_waveform = F.pad(final_waveform, (0, pad_length))
 
         if target_waveform is not None:
             # Calculate losses during training
@@ -381,8 +401,16 @@ class Concert2StudioModel(nn.Module):
         # L1 loss
         losses["l1"] = self.l1_loss(pred, target)
 
+        # Add channel dimension for auraloss (expects 3D: batch, channels, time)
+        if pred.dim() == 2:
+            pred_3d = pred.unsqueeze(1)
+            target_3d = target.unsqueeze(1)
+        else:
+            pred_3d = pred
+            target_3d = target
+
         # Multi-resolution STFT loss
-        losses["multires_stft"] = self.multires_stft_loss(pred, target)
+        losses["multires_stft"] = self.multires_stft_loss(pred_3d, target_3d)
 
         # VGGish perceptual loss
         losses["vggish"] = self.vggish_loss(pred, target)
