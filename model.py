@@ -256,15 +256,14 @@ class UnivNetWrapper(nn.Module):
             param.requires_grad = True
 
     def forward(self, spectrogram):
-        # For now, bypass the vocoder completely to debug the U-Net
-        # The vocoder might be causing the silence issue
+        # Convert spectrogram to mel-spectrogram for vocoder input
+        mel = self.mel_spectrogram(spectrogram)
 
-        # Simply return the input spectrogram as a waveform for debugging
-        # This is a temporary bypass to isolate the U-Net performance
+        # Generate clean waveform from mel-spectrogram
+        # mel shape: (B, n_mels, T)
+        waveform = self.generator(mel)
 
-        # Convert 2D spectrogram back to waveform using ISTFT
-        # Note: This is a simplified approach for debugging
-        return spectrogram  # Pass through for now
+        return waveform.squeeze(1)  # Remove channel dimension
 
 
 class MultiResSTFTLoss(nn.Module):
@@ -393,12 +392,18 @@ class Concert2StudioModel(nn.Module):
                 pad_length = waveform.shape[-1] - enhanced_waveform.shape[-1]
                 enhanced_waveform = F.pad(enhanced_waveform, (0, pad_length))
 
-        # Temporarily bypass vocoder to debug U-Net training
-        # The vocoder might be causing the silence issue
-        final_waveform = enhanced_waveform
+        # Apply vocoder for final audio enhancement and noise reduction
+        final_waveform = self.vocoder(enhanced_waveform)
 
-        # Ensure final output length matches input length (already done above)
-        # No additional processing needed since we're bypassing the vocoder
+        # Ensure final output length matches input length
+        if final_waveform.shape[-1] != waveform.shape[-1]:
+            if final_waveform.shape[-1] > waveform.shape[-1]:
+                # Trim if output is longer
+                final_waveform = final_waveform[..., : waveform.shape[-1]]
+            else:
+                # Pad if output is shorter
+                pad_length = waveform.shape[-1] - final_waveform.shape[-1]
+                final_waveform = F.pad(final_waveform, (0, pad_length))
 
         if target_waveform is not None:
             # Calculate losses during training
