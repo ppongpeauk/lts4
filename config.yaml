@@ -32,6 +32,7 @@ model:
     attention_heads: 1
 
   # UnivNet Vocoder
+  use_vocoder: true  # Set to false to bypass vocoder for debugging
   vocoder:
     model_name: "univnet-c32"
     pretrained: true

@@ -197,8 +197,8 @@ class SpectroUNet(nn.Module):
 
 class UnivNetWrapper(nn.Module):
     """
-    Wrapper for UnivNet vocoder with log-Mel conditioning
-    Downloads pretrained weights from Hugging Face Hub
+    Simplified neural vocoder for audio enhancement
+    Operates directly on waveforms with residual connections
     """
 
     def __init__(
@@ -206,44 +206,74 @@ class UnivNetWrapper(nn.Module):
         model_name: str = "univnet-c32",
         pretrained: bool = True,
         freeze_epochs: int = 0,
+        sample_rate: int = 48000,
     ):
         super().__init__()
         self.model_name = model_name
         self.freeze_epochs = freeze_epochs
+        self.sample_rate = sample_rate
 
-        # Placeholder for actual UnivNet implementation
-        # In practice, you would load the actual UnivNet model here
-        self.mel_spectrogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=48000, n_fft=1024, hop_length=256, n_mels=80
+        # Multi-scale waveform enhancement network
+        # Uses dilated convolutions for different temporal receptive fields
+        self.enhancement_blocks = nn.ModuleList(
+            [
+                # Short-term features (transients)
+                nn.Sequential(
+                    nn.Conv1d(1, 32, kernel_size=7, padding=3, dilation=1),
+                    nn.PReLU(),
+                    nn.Conv1d(32, 32, kernel_size=7, padding=3, dilation=1),
+                    nn.PReLU(),
+                ),
+                # Medium-term features (harmonics)
+                nn.Sequential(
+                    nn.Conv1d(1, 32, kernel_size=15, padding=7, dilation=1),
+                    nn.PReLU(),
+                    nn.Conv1d(32, 32, kernel_size=15, padding=14, dilation=2),
+                    nn.PReLU(),
+                ),
+                # Long-term features (texture)
+                nn.Sequential(
+                    nn.Conv1d(1, 32, kernel_size=31, padding=15, dilation=1),
+                    nn.PReLU(),
+                    nn.Conv1d(32, 32, kernel_size=31, padding=60, dilation=4),
+                    nn.PReLU(),
+                ),
+            ]
         )
 
-        # Generator network (simplified representation)
-        self.generator = nn.Sequential(
-            nn.ConvTranspose1d(80, 512, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose1d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose1d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose1d(64, 1, kernel_size=7, stride=1, padding=3),
+        # Feature fusion and output
+        self.fusion = nn.Sequential(
+            nn.Conv1d(96, 64, kernel_size=7, padding=3),  # 32*3 = 96 input channels
+            nn.PReLU(),
+            nn.Conv1d(64, 32, kernel_size=5, padding=2),
+            nn.PReLU(),
+            nn.Conv1d(32, 1, kernel_size=3, padding=1),
+        )
+
+        # High-frequency enhancer for air and presence
+        self.hf_enhance = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.PReLU(),
+            nn.Conv1d(16, 16, kernel_size=3, padding=1),
+            nn.PReLU(),
+            nn.Conv1d(16, 1, kernel_size=1),
             nn.Tanh(),
         )
 
-        if pretrained:
-            self._load_pretrained()
+        # Initialize weights properly
+        self._initialize_weights()
 
-    def _load_pretrained(self):
-        """Load pretrained weights from Hugging Face Hub"""
-        try:
-            # This is a placeholder - in practice you'd load actual UnivNet weights
-            print(f"Loading pretrained {self.model_name} weights...")
-            # weights_path = hf_hub_download(repo_id=f"facebook/{self.model_name}",
-            #                               filename="pytorch_model.bin")
-            print("Pretrained weights loaded successfully")
-        except Exception as e:
-            print(f"Warning: Could not load pretrained weights: {e}")
+    def _initialize_weights(self):
+        """Initialize weights to prevent vanishing gradients"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # Initialize final layer with small weights to start with identity-like behavior
+        if hasattr(self.fusion[-1], "weight"):
+            nn.init.xavier_uniform_(self.fusion[-1].weight, gain=0.1)
 
     def freeze_parameters(self):
         """Freeze all parameters in the vocoder"""
@@ -255,15 +285,52 @@ class UnivNetWrapper(nn.Module):
         for param in self.parameters():
             param.requires_grad = True
 
-    def forward(self, spectrogram):
-        # Convert spectrogram to mel-spectrogram for vocoder input
-        mel = self.mel_spectrogram(spectrogram)
+    def forward(self, waveform):
+        """
+        Enhance waveform using multi-scale processing
+        Args:
+            waveform: Input waveform tensor of shape (B, T) or (B, 1, T)
+        Returns:
+            Enhanced waveform of same shape as input
+        """
+        # Ensure input has channel dimension
+        if waveform.dim() == 2:
+            x = waveform.unsqueeze(1)  # (B, T) -> (B, 1, T)
+            squeeze_output = True
+        else:
+            x = waveform  # Already (B, 1, T)
+            squeeze_output = False
 
-        # Generate clean waveform from mel-spectrogram
-        # mel shape: (B, n_mels, T)
-        waveform = self.generator(mel)
+        # Store original for residual connection
+        residual = x
 
-        return waveform.squeeze(1)  # Remove channel dimension
+        # Multi-scale feature extraction
+        features = []
+        for block in self.enhancement_blocks:
+            feat = block(x)
+            features.append(feat)
+
+        # Concatenate multi-scale features
+        combined_features = torch.cat(features, dim=1)  # (B, 96, T)
+
+        # Feature fusion
+        enhanced = self.fusion(combined_features)  # (B, 1, T)
+
+        # High-frequency enhancement
+        hf_component = self.hf_enhance(x)
+
+        # Combine with residual connection and HF enhancement
+        # Use learnable mixing to prevent over-processing
+        output = residual + 0.3 * enhanced + 0.1 * hf_component
+
+        # Apply soft limiting to prevent clipping
+        output = torch.tanh(output * 0.95)
+
+        # Remove channel dimension if input was 2D
+        if squeeze_output:
+            output = output.squeeze(1)
+
+        return output
 
 
 class MultiResSTFTLoss(nn.Module):
@@ -348,7 +415,13 @@ class Concert2StudioModel(nn.Module):
         self.unet = SpectroUNet(**config["model"]["unet"])
 
         # UnivNet vocoder
-        self.vocoder = UnivNetWrapper(**config["model"]["vocoder"])
+        self.use_vocoder = config["model"].get("use_vocoder", True)
+        if self.use_vocoder:
+            vocoder_config = config["model"]["vocoder"].copy()
+            vocoder_config["sample_rate"] = config["audio"]["sample_rate"]
+            self.vocoder = UnivNetWrapper(**vocoder_config)
+        else:
+            self.vocoder = nn.Identity()
 
         # Loss functions
         self.l1_loss = nn.L1Loss()
@@ -393,7 +466,18 @@ class Concert2StudioModel(nn.Module):
                 enhanced_waveform = F.pad(enhanced_waveform, (0, pad_length))
 
         # Apply vocoder for final audio enhancement and noise reduction
-        final_waveform = self.vocoder(enhanced_waveform)
+        if self.use_vocoder:
+            final_waveform = self.vocoder(enhanced_waveform)
+            # Debug: Check for silent output
+            if torch.allclose(
+                final_waveform, torch.zeros_like(final_waveform), atol=1e-6
+            ):
+                print(
+                    "Warning: Vocoder output is silent, falling back to enhanced waveform"
+                )
+                final_waveform = enhanced_waveform
+        else:
+            final_waveform = enhanced_waveform
 
         # Ensure final output length matches input length
         if final_waveform.shape[-1] != waveform.shape[-1]:

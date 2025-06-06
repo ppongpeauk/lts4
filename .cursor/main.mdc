@@ -1,0 +1,6 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+Refer to [prd.md](mdc:prd.md) to understand what the codebase is about and how it should be implemented.
