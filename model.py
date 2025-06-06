@@ -609,21 +609,21 @@ class Concert2StudioModel(nn.Module):
             print(f"STFT loss computation failed: {e}")
             losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-        # Add spectral coherence loss for better noise reduction
+            # Add spectral coherence loss for better noise reduction
         try:
-            pred_spec = self.stft(pred)
-            target_spec = self.stft(target_smooth)
+            pred_spec = self.stft(pred).contiguous()
+            target_spec = self.stft(target_smooth).contiguous()
 
             # Magnitude loss for spectral clarity
-            pred_mag = torch.abs(pred_spec)
-            target_mag = torch.abs(target_spec)
+            pred_mag = torch.abs(pred_spec).contiguous()
+            target_mag = torch.abs(target_spec).contiguous()
             spectral_loss = F.l1_loss(pred_mag, target_mag)
             losses["spectral"] = torch.clamp(spectral_loss, max=3.0)
 
             # Phase coherence loss for naturalness
-            pred_phase = torch.angle(pred_spec)
-            target_phase = torch.angle(target_spec)
-            phase_diff = torch.abs(torch.sin(pred_phase - target_phase))
+            pred_phase = torch.angle(pred_spec).contiguous()
+            target_phase = torch.angle(target_spec).contiguous()
+            phase_diff = torch.abs(torch.sin(pred_phase - target_phase)).contiguous()
             phase_loss = torch.mean(phase_diff)
             losses["phase"] = torch.clamp(phase_loss, max=1.0)
 
