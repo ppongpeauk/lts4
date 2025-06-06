@@ -26,7 +26,7 @@ audio:
   segment_length: 4.0  # Moderate segments for better training
   n_fft: 1024  # Optimal FFT size for balance of resolution and stability
   hop_length: 256  # 75% overlap for better reconstruction
-  win_length: 1024
+  win_length: 1024  # Keep same as n_fft (matching trained model)
   window: "hann"
 
 # Model Architecture

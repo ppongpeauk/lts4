@@ -345,54 +345,101 @@ class GriffinLimReconstruction(nn.Module):
         # magnitude: (B, F, T) where F = n_fft//2 + 1
         batch_size = magnitude.shape[0]
 
+        # Ensure magnitude is in reasonable range and positive
+        magnitude = torch.clamp(magnitude, min=1e-8, max=100.0)
+
         # Initialize with random phase
         phase = torch.rand_like(magnitude) * 2 * math.pi - math.pi
+
+        # Validate STFT parameters for overlap-add
+        if self.hop_length >= self.win_length:
+            print(
+                f"Warning: hop_length ({self.hop_length}) >= win_length ({self.win_length}), using safer ratio"
+            )
+            hop_length = self.win_length // 4
+        else:
+            hop_length = self.hop_length
 
         for _ in range(self.n_iter):
             # Reconstruct complex spectrogram
             complex_spec = magnitude * torch.exp(1j * phase)
 
-            # ISTFT to time domain
-            waveform = torch.istft(
-                complex_spec,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.win_length,
-                window=self.window,
-                normalized=True,
-                onesided=True,
-                return_complex=False,
-            )
+            try:
+                # ISTFT to time domain with proper parameters
+                waveform = torch.istft(
+                    complex_spec,
+                    n_fft=self.n_fft,
+                    hop_length=hop_length,
+                    win_length=self.win_length,
+                    window=self.window,
+                    normalized=True,
+                    onesided=True,
+                    return_complex=False,
+                    length=None,  # Let PyTorch determine length
+                    center=True,  # Ensure proper centering
+                )
+            except Exception as e:
+                print(f"Griffin-Lim ISTFT failed: {e}")
+                # Fallback: return zero tensor with expected length
+                expected_length = (magnitude.shape[-1] - 1) * hop_length
+                return torch.zeros(
+                    (batch_size, expected_length),
+                    device=magnitude.device,
+                    dtype=torch.float32,
+                )
 
-            # STFT back to frequency domain
-            new_complex_spec = torch.stft(
-                waveform,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.win_length,
-                window=self.window,
-                normalized=True,
-                onesided=True,
-                return_complex=True,
-            )
+            try:
+                # STFT back to frequency domain with same parameters
+                new_complex_spec = torch.stft(
+                    waveform,
+                    n_fft=self.n_fft,
+                    hop_length=hop_length,
+                    win_length=self.win_length,
+                    window=self.window,
+                    normalized=True,
+                    onesided=True,
+                    return_complex=True,
+                    center=True,  # Ensure proper centering
+                )
+            except Exception as e:
+                print(f"Griffin-Lim STFT failed: {e}")
+                # Fallback: return zero tensor
+                expected_length = (magnitude.shape[-1] - 1) * hop_length
+                return torch.zeros(
+                    (batch_size, expected_length),
+                    device=magnitude.device,
+                    dtype=torch.float32,
+                )
 
             # Update phase
             phase = torch.angle(new_complex_spec)
 
         # Final reconstruction
         final_complex_spec = magnitude * torch.exp(1j * phase)
-        final_waveform = torch.istft(
-            final_complex_spec,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            normalized=True,
-            onesided=True,
-            return_complex=False,
-        )
 
-        return final_waveform
+        try:
+            final_waveform = torch.istft(
+                final_complex_spec,
+                n_fft=self.n_fft,
+                hop_length=hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                normalized=True,
+                onesided=True,
+                return_complex=False,
+                length=None,
+                center=True,
+            )
+            return final_waveform
+        except Exception as e:
+            print(f"Griffin-Lim final ISTFT failed: {e}")
+            # Fallback: return zero tensor
+            expected_length = (magnitude.shape[-1] - 1) * hop_length
+            return torch.zeros(
+                (batch_size, expected_length),
+                device=magnitude.device,
+                dtype=torch.float32,
+            )
 
 
 class EnhancedUnivNetWrapper(nn.Module):
@@ -879,6 +926,7 @@ class Concert2StudioModel(nn.Module):
                 # Convert to spectrogram
                 spec = self.stft(channel_waveform)
                 magnitude = torch.abs(spec)
+                original_phase = torch.angle(spec)  # Keep original phase!
 
                 # Reshape for U-Net: treat spectrogram as 2D image
                 # (B, freq, time) -> (B, 1, freq, time)
@@ -894,18 +942,58 @@ class Concert2StudioModel(nn.Module):
                 # Ensure magnitude is positive and stable
                 enhanced_magnitude = torch.clamp(enhanced_magnitude, min=1e-8)
 
-                # Reconstruct waveform using Griffin-Lim
+                # MORE AGGRESSIVE CLAMPING for real audio stability
+                # Clamp to reasonable magnitude range based on original
+                max_original_magnitude = torch.max(magnitude)
+                max_enhanced_magnitude = (
+                    max_original_magnitude * 2.0
+                )  # Allow 2x amplification max
+                enhanced_magnitude = torch.clamp(
+                    enhanced_magnitude, min=1e-8, max=max_enhanced_magnitude
+                )
+
+                # Additional stability checks
+                if (
+                    torch.isnan(enhanced_magnitude).any()
+                    or torch.isinf(enhanced_magnitude).any()
+                ):
+                    print(
+                        f"Warning: NaN/Inf in enhanced magnitude channel {ch}, using original"
+                    )
+                    enhanced_magnitude = magnitude  # Use original magnitude
+
+                # Check for extremely large values that could cause ISTFT issues
+                if torch.max(enhanced_magnitude) > 100.0:
+                    print(
+                        f"Warning: Very large magnitude values channel {ch}, clamping"
+                    )
+                    enhanced_magnitude = torch.clamp(enhanced_magnitude, max=10.0)
+
+                # BYPASS GRIFFIN-LIM: Use original phase with enhanced magnitude
+                enhanced_complex_spec = enhanced_magnitude * torch.exp(
+                    1j * original_phase
+                )
+
+                # Direct ISTFT reconstruction (much more stable!)
                 try:
-                    enhanced_channel = self.griffin_lim(enhanced_magnitude)
+                    enhanced_channel = torch.istft(
+                        enhanced_complex_spec,
+                        n_fft=self.n_fft,
+                        hop_length=self.hop_length,
+                        win_length=self.win_length,
+                        window=self.window,
+                        normalized=True,
+                        onesided=True,
+                        return_complex=False,
+                        center=True,
+                    )
 
                     # Check for NaN/Inf in reconstruction
                     if (
                         torch.isnan(enhanced_channel).any()
                         or torch.isinf(enhanced_channel).any()
                     ):
-                        print(
-                            f"Warning: NaN/Inf in Griffin-Lim channel {ch}, using original"
-                        )
+                        print(f"Warning: NaN/Inf in ISTFT channel {ch}, using original")
                         enhanced_channel = channel_waveform
 
                     # Clamp to prevent extreme values
@@ -913,7 +1001,7 @@ class Concert2StudioModel(nn.Module):
 
                 except Exception as e:
                     print(
-                        f"Warning: Griffin-Lim failed for channel {ch}: {e}, using original"
+                        f"Warning: ISTFT failed for channel {ch}: {e}, using original"
                     )
                     enhanced_channel = channel_waveform
 
@@ -934,6 +1022,7 @@ class Concert2StudioModel(nn.Module):
             # Convert to spectrogram
             spec = self.stft(waveform)
             magnitude = torch.abs(spec)
+            original_phase = torch.angle(spec)  # Keep original phase!
 
             # Reshape for U-Net: treat spectrogram as 2D image
             # (B, freq, time) -> (B, 1, freq, time)
@@ -949,23 +1038,59 @@ class Concert2StudioModel(nn.Module):
             # Ensure magnitude is positive and stable
             enhanced_magnitude = torch.clamp(enhanced_magnitude, min=1e-8)
 
-            # Reconstruct waveform using Griffin-Lim
+            # MORE AGGRESSIVE CLAMPING for real audio stability
+            # Clamp to reasonable magnitude range based on original
+            max_original_magnitude = torch.max(magnitude)
+            max_enhanced_magnitude = (
+                max_original_magnitude * 2.0
+            )  # Allow 2x amplification max
+            enhanced_magnitude = torch.clamp(
+                enhanced_magnitude, min=1e-8, max=max_enhanced_magnitude
+            )
+
+            # Additional stability checks
+            if (
+                torch.isnan(enhanced_magnitude).any()
+                or torch.isinf(enhanced_magnitude).any()
+            ):
+                print(f"Warning: NaN/Inf in enhanced magnitude, using original")
+                enhanced_magnitude = magnitude  # Use original magnitude
+
+            # Check for extremely large values that could cause ISTFT issues
+            if torch.max(enhanced_magnitude) > 100.0:
+                print(f"Warning: Very large magnitude values, clamping")
+                enhanced_magnitude = torch.clamp(enhanced_magnitude, max=10.0)
+
+            # BYPASS GRIFFIN-LIM: Use original phase with enhanced magnitude
+            enhanced_complex_spec = enhanced_magnitude * torch.exp(1j * original_phase)
+
+            # Direct ISTFT reconstruction (much more stable!)
             try:
-                enhanced_waveform = self.griffin_lim(enhanced_magnitude)
+                enhanced_waveform = torch.istft(
+                    enhanced_complex_spec,
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    win_length=self.win_length,
+                    window=self.window,
+                    normalized=True,
+                    onesided=True,
+                    return_complex=False,
+                    center=True,
+                )
 
                 # Check for NaN/Inf in reconstruction
                 if (
                     torch.isnan(enhanced_waveform).any()
                     or torch.isinf(enhanced_waveform).any()
                 ):
-                    print(f"Warning: NaN/Inf in Griffin-Lim, using original")
+                    print(f"Warning: NaN/Inf in ISTFT, using original")
                     enhanced_waveform = waveform
 
                 # Clamp to prevent extreme values
                 enhanced_waveform = torch.clamp(enhanced_waveform, -1.0, 1.0)
 
             except Exception as e:
-                print(f"Warning: Griffin-Lim failed: {e}, using original")
+                print(f"Warning: ISTFT failed: {e}, using original")
                 enhanced_waveform = waveform
 
         # Ensure output length matches input length

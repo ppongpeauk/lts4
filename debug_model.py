@@ -25,8 +25,8 @@ def create_synthetic_audio(batch_size=2, channels=2, duration=4.0, sample_rate=4
         left_channel = 0.1 * torch.sin(2 * np.pi * left_freq * t)
         right_channel = 0.1 * torch.sin(2 * np.pi * right_freq * t)
 
-        # Shape: (batch_size, 2, time_samples)
-        audio = (
+        # Stack channels: (batch, channels, time)
+        waveform = (
             torch.stack([left_channel, right_channel], dim=0)
             .unsqueeze(0)
             .repeat(batch_size, 1, 1)
@@ -34,108 +34,112 @@ def create_synthetic_audio(batch_size=2, channels=2, duration=4.0, sample_rate=4
     else:
         # Mono
         freq = 440.0
-        audio = 0.1 * torch.sin(2 * np.pi * freq * t).unsqueeze(0).repeat(batch_size, 1)
+        waveform = 0.1 * torch.sin(2 * np.pi * freq * t).unsqueeze(0).repeat(
+            batch_size, 1
+        )
 
-    return audio
+    return waveform
 
 
-def test_model():
-    """Test the model with synthetic data"""
-    print("🔧 Testing Concert2Studio model with synthetic data...")
+def debug_model_inference():
+    """Debug the model step by step"""
 
     # Load config
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
 
     # Create model
-    print("Creating model...")
     model = Concert2StudioModel(config)
     model.eval()
 
-    # Print model info
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    # Create test data
+    test_audio = create_synthetic_audio(batch_size=1, channels=2, duration=1.0)
+    print(
+        f"Input audio: shape={test_audio.shape}, range=[{test_audio.min():.4f}, {test_audio.max():.4f}]"
+    )
 
-    # Create synthetic input
-    print("\nCreating synthetic test audio...")
-    batch_size = 1
-    channels = 2 if config["model"]["unet"]["use_stereo"] else 1
-    duration = config["audio"]["segment_length"]
-    sample_rate = config["data"]["sample_rate"]
-
-    if channels == 2:
-        input_audio = create_synthetic_audio(
-            batch_size, channels, duration, sample_rate
-        )
-        target_audio = input_audio * 1.1  # Slightly louder target
-    else:
-        input_audio = create_synthetic_audio(batch_size, 1, duration, sample_rate)
-        target_audio = input_audio * 1.1
-
-    print(f"Input shape: {input_audio.shape}")
-    print(f"Input range: [{input_audio.min():.4f}, {input_audio.max():.4f}]")
-    print(f"Target shape: {target_audio.shape}")
-    print(f"Target range: [{target_audio.min():.4f}, {target_audio.max():.4f}]")
-
-    # Test forward pass
-    print("\n🚀 Testing forward pass...")
     with torch.no_grad():
-        try:
-            output = model(input_audio)
-            print(f"✅ Forward pass successful!")
-            print(f"Output shape: {output.shape}")
-            print(f"Output range: [{output.min():.4f}, {output.max():.4f}]")
+        # Extract one channel for debugging
+        channel_waveform = test_audio[:, 0, :]  # (1, T)
+        print(
+            f"Single channel: shape={channel_waveform.shape}, range=[{channel_waveform.min():.4f}, {channel_waveform.max():.4f}]"
+        )
 
-            # Check if output is reasonable
-            if torch.allclose(output, torch.zeros_like(output), atol=1e-6):
-                print("❌ WARNING: Output is silent/zero!")
-            elif torch.std(output) < 1e-6:
-                print("❌ WARNING: Output has no variation (constant value)!")
-            elif torch.abs(output).max() > 1.0:
-                print("❌ WARNING: Output exceeds audio range [-1, 1]!")
-            else:
-                print("✅ Output appears reasonable")
+        # STFT
+        spec = model.stft(channel_waveform)
+        magnitude = torch.abs(spec)
+        original_phase = torch.angle(spec)
+        print(
+            f"Original magnitude: shape={magnitude.shape}, range=[{magnitude.min():.4f}, {magnitude.max():.4f}]"
+        )
+        print(
+            f"Original phase: shape={original_phase.shape}, range=[{original_phase.min():.4f}, {original_phase.max():.4f}]"
+        )
+
+        # U-Net processing
+        magnitude_4d = magnitude.unsqueeze(1)
+        print(f"Magnitude 4D input: shape={magnitude_4d.shape}")
+
+        enhanced_magnitude_4d = model.unet(magnitude_4d)
+        enhanced_magnitude = enhanced_magnitude_4d.squeeze(1)
+        print(
+            f"Enhanced magnitude: shape={enhanced_magnitude.shape}, range=[{enhanced_magnitude.min():.4f}, {enhanced_magnitude.max():.4f}]"
+        )
+
+        # Check for problematic values
+        if torch.isnan(enhanced_magnitude).any():
+            print("❌ Enhanced magnitude contains NaN!")
+        if torch.isinf(enhanced_magnitude).any():
+            print("❌ Enhanced magnitude contains Inf!")
+        if torch.any(enhanced_magnitude < 0):
+            print("❌ Enhanced magnitude contains negative values!")
+        if torch.any(enhanced_magnitude > 1000):
+            print("❌ Enhanced magnitude contains very large values!")
+
+        # Clamp and reconstruct
+        enhanced_magnitude = torch.clamp(
+            enhanced_magnitude, min=1e-8, max=10.0
+        )  # More aggressive clamping
+        print(
+            f"Clamped magnitude: range=[{enhanced_magnitude.min():.4f}, {enhanced_magnitude.max():.4f}]"
+        )
+
+        # Create complex spectrogram
+        enhanced_complex_spec = enhanced_magnitude * torch.exp(1j * original_phase)
+        print(f"Enhanced complex spec: shape={enhanced_complex_spec.shape}")
+
+        # Check complex values
+        if torch.isnan(enhanced_complex_spec).any():
+            print("❌ Enhanced complex spec contains NaN!")
+        if torch.isinf(enhanced_complex_spec).any():
+            print("❌ Enhanced complex spec contains Inf!")
+
+        # Try ISTFT
+        try:
+            reconstructed = torch.istft(
+                enhanced_complex_spec,
+                n_fft=model.n_fft,
+                hop_length=model.hop_length,
+                win_length=model.win_length,
+                window=model.window,
+                normalized=True,
+                onesided=True,
+                return_complex=False,
+                center=True,
+            )
+            print(
+                f"✅ ISTFT successful: shape={reconstructed.shape}, range=[{reconstructed.min():.4f}, {reconstructed.max():.4f}]"
+            )
+
+            if torch.isnan(reconstructed).any():
+                print("❌ Reconstructed audio contains NaN!")
+            if torch.isinf(reconstructed).any():
+                print("❌ Reconstructed audio contains Inf!")
 
         except Exception as e:
-            print(f"❌ Forward pass failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-
-    # Test training mode
-    print("\n🎯 Testing training mode (with losses)...")
-    model.train()
-    try:
-        output, losses = model(input_audio, target_audio)
-        print(f"✅ Training pass successful!")
-        print(f"Output shape: {output.shape}")
-        print(f"Output range: [{output.min():.4f}, {output.max():.4f}]")
-
-        print("Loss breakdown:")
-        for loss_name, loss_value in losses.items():
-            if isinstance(loss_value, torch.Tensor):
-                print(f"  {loss_name}: {loss_value.item():.6f}")
-            else:
-                print(f"  {loss_name}: {loss_value}")
-
-        # Check if losses are reasonable
-        total_loss = losses["total"].item()
-        if total_loss > 100:
-            print(f"❌ WARNING: Total loss is very high: {total_loss:.6f}")
-        elif total_loss < 1e-8:
-            print(f"❌ WARNING: Total loss is suspiciously low: {total_loss:.6f}")
-        else:
-            print(f"✅ Total loss appears reasonable: {total_loss:.6f}")
-
-    except Exception as e:
-        print(f"❌ Training pass failed: {e}")
-        import traceback
-
-        traceback.print_exc()
+            print(f"❌ ISTFT failed: {e}")
 
 
 if __name__ == "__main__":
-    test_model()
+    print("🔍 Debugging model inference step by step...")
+    debug_model_inference()
