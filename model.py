@@ -605,6 +605,8 @@ class Concert2StudioModel(nn.Module):
 
             # Process each channel separately
             enhanced_channels = []
+            target_length = time_samples  # Use original length as target
+
             for ch in range(channels):
                 # Extract single channel: (B, T)
                 channel_waveform = waveform[:, ch, :]
@@ -630,6 +632,15 @@ class Concert2StudioModel(nn.Module):
 
                 # Convert back to waveform
                 enhanced_channel = self.istft(enhanced_spec)
+
+                # Ensure exact length match for concatenation
+                if enhanced_channel.shape[-1] != target_length:
+                    if enhanced_channel.shape[-1] > target_length:
+                        enhanced_channel = enhanced_channel[..., :target_length]
+                    else:
+                        pad_length = target_length - enhanced_channel.shape[-1]
+                        enhanced_channel = F.pad(enhanced_channel, (0, pad_length))
+
                 enhanced_channels.append(enhanced_channel)
 
             # Combine channels: (B, 2, T)
