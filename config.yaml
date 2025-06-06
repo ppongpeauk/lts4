@@ -38,7 +38,7 @@ model:
   vocoder:
     model_name: "univnet-c32"
     pretrained: false  # Train from scratch for better fit
-    freeze_epochs: 15  # Freeze longer to establish stable UNet first
+    freeze_epochs: 25  # Freeze much longer to establish stable UNet first
     use_stereo: true  # Enable stereo output
 
 # Training Configuration (anti-overfitting for tiny dataset)
