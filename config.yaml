@@ -46,7 +46,7 @@ training:
   beta1: 0.8
   beta2: 0.99
   warmup_steps: 2000
-  early_stopping_patience: 5
+  early_stopping_patience: 15
   gradient_accumulation_steps: 1
 
 # Loss Configuration
