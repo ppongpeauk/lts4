@@ -28,12 +28,12 @@ model:
     max_channels: 16  # Extreme reduction
     n_blocks: 1  # Single block only
     dilations: [1]  # No dilation
-    use_attention: false  # Disabled to reduce params
+    use_attention: true  # Disabled to reduce params
     attention_heads: 1
     dropout: 0.5  # Extreme regularization
 
   # UnivNet Vocoder (disabled for stability)
-  use_vocoder: false  # Disabled to prevent overfitting
+  use_vocoder: true  # Disabled to prevent overfitting
   vocoder:
     model_name: "univnet-c32"
     pretrained: true
