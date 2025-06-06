@@ -38,27 +38,27 @@ model:
   vocoder:
     model_name: "univnet-c32"
     pretrained: false  # Train from scratch for better fit
-    freeze_epochs: 5
+    freeze_epochs: 15  # Freeze longer to establish stable UNet first
     use_stereo: true  # Enable stereo output
 
 # Training Configuration (research-optimized for small dataset)
 training:
-  batch_size: 1  # Small but efficient batches
+  batch_size: 2  # Small but efficient batches
   num_epochs: 50  # More training with better regularization
-  learning_rate: 1e-4  # Standard learning rate
-  weight_decay: 1e-3  # Moderate L2 regularization
+  learning_rate: 2e-5  # Much lower learning rate for stability
+  weight_decay: 1e-4  # Reduced L2 regularization to prevent over-regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
-  warmup_steps: 100  # Proper warmup for stability
-  early_stopping_patience: 10  # More patience with better model
+  warmup_steps: 200  # Longer warmup for stability
+  early_stopping_patience: 15  # More patience with unstable training
   gradient_accumulation_steps: 4  # Effective batch size 8
-  max_grad_norm: 1.0  # Standard gradient clipping
-  scheduler: "cosine"  # Cosine annealing for stability
+  max_grad_norm: 0.5  # Stricter gradient clipping
+  scheduler: "linear"  # Linear decay instead of cosine for stability
 
 # Loss Configuration (simplified for stability)
 loss:
-  l1_weight: 0.7  # Dominant reconstruction loss
-  multires_stft_weight: 0.2  # Reduced spectral loss
+  l1_weight: 1.0  # Focus primarily on L1 reconstruction
+  multires_stft_weight: 0.0  # Disable spectral loss initially for stability
   vggish_weight: 0.0  # Disabled heavy perceptual loss
   adversarial_weight: 0.0  # Disabled for stability
 
@@ -67,18 +67,18 @@ loss:
 
 # Data Augmentation (research-based for small datasets)
 augmentation:
-  gain_jitter_db: 3.0  # Moderate variation
-  gain_jitter_prob: 0.8
-  pink_noise_prob: 0.3  # Controlled noise augmentation
-  pink_noise_level: -40  # Subtle noise injection
-  time_shift_ms: 50  # Moderate time variation
-  time_shift_prob: 0.7  # Frequent but not always
+  gain_jitter_db: 1.0  # Much reduced variation for stability
+  gain_jitter_prob: 0.3  # Reduced probability
+  pink_noise_prob: 0.1  # Minimal noise augmentation
+  pink_noise_level: -50  # Even more subtle noise injection
+  time_shift_ms: 20  # Reduced time variation
+  time_shift_prob: 0.3  # Reduced probability
   # Advanced augmentation techniques from research
-  mixup_prob: 0.2  # Mix samples for better generalization
-  mixup_alpha: 0.4  # Conservative mixing
-  spec_augment_prob: 0.5  # Spectrogram augmentation
-  freq_mask_prob: 0.3
-  time_mask_prob: 0.3
+  mixup_prob: 0.0  # Disable mixup initially for stability
+  mixup_alpha: 0.2  # Reduced mixing if enabled
+  spec_augment_prob: 0.0  # Disable spectrogram augmentation initially
+  freq_mask_prob: 0.1
+  time_mask_prob: 0.1
 
 # Checkpointing and Logging
 checkpoint:
