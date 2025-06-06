@@ -1,0 +1,19 @@
+name: concert2studio
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - pytorch=2.7
+  - torchaudio
+  - librosa             # resampler fallback
+  - accelerate
+  - tqdm
+  - pyyaml
+  - git
+  - pip
+  - pip:
+    - pypesq
+    - huggingface_hub
+    - soundfile
+    - auraloss[all] # STFT & Mel losses

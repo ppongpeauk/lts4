@@ -1,0 +1,90 @@
+# Concert2Studio Configuration
+# All hyperparameters, paths, and toggle flags
+
+# Data Configuration
+data:
+  data_dir: "./data"
+  sample_rate: 48000
+  bit_depth: 24
+  train_split: 0.9
+  val_split: 0.1
+  random_seed: 42
+  use_synthetic: false  # Use synthetic RIR pre-training
+
+# Audio Processing
+audio:
+  segment_length: 3.0  # seconds
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  window: "hann"
+
+# Model Architecture
+model:
+  # Spectrogram U-Net
+  unet:
+    in_channels: 513  # n_fft//2 + 1
+    base_channels: 48
+    max_channels: 768
+    n_blocks: 6
+    dilations: [1, 2, 4, 8]
+    use_attention: true
+    attention_heads: 1
+
+  # UnivNet Vocoder
+  vocoder:
+    model_name: "univnet-c32"
+    pretrained: true
+    freeze_epochs: 5
+
+# Training Configuration
+training:
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 2e-4
+  weight_decay: 1e-3
+  beta1: 0.8
+  beta2: 0.99
+  warmup_steps: 2000
+  early_stopping_patience: 5
+  gradient_accumulation_steps: 1
+
+# Loss Configuration
+loss:
+  l1_weight: 0.5
+  multires_stft_weight: 0.5
+  vggish_weight: 0.05
+  adversarial_weight: 4e-4
+
+  # Multi-resolution STFT scales
+  stft_scales: [512, 1024, 2048, 4096]
+
+# Data Augmentation
+augmentation:
+  gain_jitter_db: 3.0
+  gain_jitter_prob: 1.0
+  pink_noise_prob: 0.2
+  pink_noise_level: -40  # dB
+  time_shift_ms: 50
+  time_shift_prob: 0.8
+
+# Checkpointing and Logging
+checkpoint:
+  save_interval_minutes: 15
+  save_interval_steps: 500
+  max_checkpoints: 5
+  resume_from: null  # path to checkpoint to resume from
+
+# Hardware Configuration
+hardware:
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  compile_model: true  # Use torch.compile for speedup
+  channels_last: true  # Memory layout optimization
+
+# Paths
+paths:
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"

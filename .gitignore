@@ -1,0 +1,11 @@
+data/
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ptl
+*.pthl
+*.ptz
+*.pthz
+*.ptt
+*.phtt
