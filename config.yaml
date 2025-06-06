@@ -9,7 +9,7 @@ data:
   train_split: 0.8
   val_split: 0.2
   random_seed: 42
-  use_synthetic: false  # Disable synthetic data to prevent overfitting
+  use_synthetic: true  # Disable synthetic data to prevent overfitting
 
 # Audio Processing (extreme reduction for tiny dataset)
 audio:
