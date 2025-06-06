@@ -43,8 +43,8 @@ model:
 training:
   batch_size: 1  # Single sample batches
   num_epochs: 20  # Very short training
-  learning_rate: 5e-5  # Very conservative learning rate
-  weight_decay: 5e-2  # Extreme regularization
+  learning_rate: 1e-4  # Conservative learning rate
+  weight_decay: 1e-2  # Strong regularization
   beta1: 0.9  # Standard Adam parameters
   beta2: 0.999
   warmup_steps: 20  # Minimal warmup
