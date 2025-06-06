@@ -418,7 +418,7 @@ class Concert2StudioModel(nn.Module):
         self.use_vocoder = config["model"].get("use_vocoder", True)
         if self.use_vocoder:
             vocoder_config = config["model"]["vocoder"].copy()
-            vocoder_config["sample_rate"] = config["audio"]["sample_rate"]
+            vocoder_config["sample_rate"] = config["data"]["sample_rate"]
             self.vocoder = UnivNetWrapper(**vocoder_config)
         else:
             self.vocoder = nn.Identity()
