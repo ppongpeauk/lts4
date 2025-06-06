@@ -188,9 +188,9 @@ class SpectroUNet(nn.Module):
         self.use_stereo = use_stereo
         self.dropout = nn.Dropout2d(dropout)
 
-        # Adjust channels for stereo
-        if use_stereo:
-            out_channels = in_channels * 2  # Stereo output
+        # Keep input and output channels the same
+        # Stereo processing is handled at the model level, not UNet level
+        out_channels = in_channels
 
         # Calculate channel progression
         channels = [base_channels * (2**i) for i in range(n_blocks)]
@@ -314,17 +314,9 @@ class SpectroUNet(nn.Module):
         # Output with residual connection
         enhancement = self.output(x)
 
-        if self.use_stereo:
-            # For stereo, expand mono input to stereo enhancement
-            if residual_input.shape[1] * 2 == enhancement.shape[1]:
-                # Duplicate mono input for stereo processing
-                stereo_input = torch.cat([residual_input, residual_input], dim=1)
-                output = stereo_input + 0.5 * enhancement  # Conservative enhancement
-            else:
-                output = enhancement
-        else:
-            # Mono output with residual connection
-            output = residual_input + 0.7 * enhancement
+        # Apply residual connection regardless of stereo/mono
+        # The stereo processing is handled at the model level
+        output = residual_input + 0.7 * enhancement
 
         return output
 
