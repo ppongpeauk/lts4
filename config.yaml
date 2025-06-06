@@ -80,7 +80,7 @@ hardware:
   num_workers: 4
   pin_memory: true
   persistent_workers: true
-  compile_model: true  # Use torch.compile for speedup
+  compile_model: false  # Disabled to avoid CUDA compilation issues
   channels_last: false  # Not applicable to audio models
 
 # Paths
