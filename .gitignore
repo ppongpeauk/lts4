@@ -9,3 +9,4 @@ checkpoints/
 *.pthz
 *.ptt
 *.phtt
+_pycache_/
