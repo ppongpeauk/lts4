@@ -241,8 +241,6 @@ class MultiResSTFTLoss(nn.Module):
             fft_sizes=scales,
             hop_sizes=[s // 4 for s in scales],
             win_lengths=scales,
-            mag_weight=1.0,
-            log_mag_weight=1.0,
         )
 
     def forward(self, pred, target):
