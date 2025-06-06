@@ -4,7 +4,7 @@
 # Data Configuration
 data:
   data_dir: "./data"
-  sample_rate: 48000  # Use 48kHz for better audio quality and noise reduction
+  sample_rate: 44100  # Use 48kHz for better audio quality and noise reduction
   bit_depth: 24
   train_split: 0.8
   val_split: 0.2
