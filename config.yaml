@@ -4,12 +4,12 @@
 # Data Configuration
 data:
   data_dir: "./data"
-  sample_rate: 44100
+  sample_rate: 48000  # Standard rate for better compatibility
   bit_depth: 24
   train_split: 0.9
   val_split: 0.1
   random_seed: 42
-  use_synthetic: true  # Use synthetic RIR pre-training
+  use_synthetic: false  # Disable synthetic data to prevent overfitting
 
 # Audio Processing
 audio:
@@ -21,15 +21,16 @@ audio:
 
 # Model Architecture
 model:
-  # Spectrogram U-Net
+  # Spectrogram U-Net (optimized for 16 samples)
   unet:
     in_channels: 1  # Single channel magnitude spectrogram
-    base_channels: 32
-    max_channels: 256
-    n_blocks: 5  # Reduced from PRD's 6 to stay under 12M params
-    dilations: [1, 2, 4, 8]
+    base_channels: 16  # Heavily reduced for small dataset
+    max_channels: 128  # Heavily reduced
+    n_blocks: 3  # Minimal architecture
+    dilations: [1, 2, 4]  # Simplified
     use_attention: false  # Disabled to reduce params
     attention_heads: 1
+    dropout: 0.2  # Strong regularization
 
   # UnivNet Vocoder
   use_vocoder: true  # Set to false to bypass vocoder for debugging
@@ -38,27 +39,28 @@ model:
     pretrained: true
     freeze_epochs: 5
 
-# Training Configuration
+# Training Configuration (optimized for small dataset)
 training:
-  batch_size: 8  # Reduced to avoid memory issues and training instability
-  num_epochs: 100
-  learning_rate: 2e-4
-  weight_decay: 1e-3
-  beta1: 0.8
-  beta2: 0.99
-  warmup_steps: 2000
-  early_stopping_patience: 15
-  gradient_accumulation_steps: 1
+  batch_size: 4  # Smaller batches for better generalization
+  num_epochs: 50  # Reduced to prevent overfitting
+  learning_rate: 5e-5  # Much lower learning rate for stability
+  weight_decay: 1e-2  # Strong regularization
+  beta1: 0.9  # Standard Adam parameters
+  beta2: 0.999
+  warmup_steps: 100  # Shorter warmup for small dataset
+  early_stopping_patience: 8  # Earlier stopping
+  gradient_accumulation_steps: 2  # Effective batch size 8
+  max_grad_norm: 0.5  # Gradient clipping
 
-# Loss Configuration
+# Loss Configuration (simplified for stability)
 loss:
-  l1_weight: 1.0  # Increased for stronger reconstruction signal
-  multires_stft_weight: 1.0  # Increased for better spectral quality
-  vggish_weight: 0.1  # Increased perceptual loss weight
-  adversarial_weight: 4e-4
+  l1_weight: 0.7  # Dominant reconstruction loss
+  multires_stft_weight: 0.2  # Reduced spectral loss
+  vggish_weight: 0.0  # Disabled heavy perceptual loss
+  adversarial_weight: 0.0  # Disabled for stability
 
-  # Multi-resolution STFT scales
-  stft_scales: [512, 1024, 2048, 4096]
+  # Multi-resolution STFT scales (reduced for stability)
+  stft_scales: [512, 1024, 2048]
 
 # Data Augmentation
 augmentation:

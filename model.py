@@ -72,37 +72,43 @@ class AttentionBlock(nn.Module):
 
 class SpectroUNet(nn.Module):
     """
-    Spectrogram U-Net for audio denoising and enhancement
-    Architecture: 6 down/6 up blocks with dilated convolutions and skip connections
+    Lightweight Spectrogram U-Net for audio denoising and enhancement
+    Reduced complexity to prevent overfitting with limited data
     """
 
     def __init__(
         self,
         in_channels: int = 513,
-        base_channels: int = 48,
-        max_channels: int = 768,
-        n_blocks: int = 6,
-        dilations: List[int] = [1, 2, 4, 8],
-        use_attention: bool = True,
+        base_channels: int = 24,  # Reduced from 48
+        max_channels: int = 192,  # Reduced from 768
+        n_blocks: int = 4,  # Reduced from 6
+        dilations: List[int] = [1, 2, 4],  # Simplified
+        use_attention: bool = False,  # Disabled to reduce params
         attention_heads: int = 1,
+        dropout: float = 0.1,  # Added dropout for regularization
     ):
         super().__init__()
 
         self.n_blocks = n_blocks
         self.use_attention = use_attention
+        self.dropout = nn.Dropout2d(dropout)
 
         # Calculate channel progression
         channels = [base_channels * (2**i) for i in range(n_blocks)]
         channels = [min(c, max_channels) for c in channels]
         channels = [in_channels] + channels
 
-        # Encoder blocks
+        # Encoder blocks with dropout
         self.encoder_blocks = nn.ModuleList()
         for i in range(n_blocks):
-            dilation = dilations[i % len(dilations)] if i >= 2 and i <= 4 else 1
-            self.encoder_blocks.append(
-                ConvBlock(channels[i], channels[i + 1], dilation=dilation, stride=2)
+            dilation = dilations[i % len(dilations)] if i < len(dilations) else 1
+            block = nn.Sequential(
+                ConvBlock(channels[i], channels[i + 1], dilation=dilation, stride=2),
+                (
+                    nn.Dropout2d(dropout) if i > 0 else nn.Identity()
+                ),  # Skip dropout on first layer
             )
+            self.encoder_blocks.append(block)
 
         # Bottleneck with attention
         self.bottleneck = nn.Sequential(
@@ -115,27 +121,34 @@ class SpectroUNet(nn.Module):
             ConvBlock(channels[-1], channels[-1]),
         )
 
-        # Decoder blocks
+        # Decoder blocks with dropout and residual connections
         self.decoder_blocks = nn.ModuleList()
         for i in range(n_blocks):
             in_ch = (
                 channels[n_blocks - i] + channels[n_blocks - i - 1]
             )  # skip connection
             out_ch = channels[n_blocks - i - 1]
-            self.decoder_blocks.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(
-                        channels[n_blocks - i],
-                        channels[n_blocks - i],
-                        kernel_size=2,
-                        stride=2,
-                    ),
-                    ConvBlock(in_ch, out_ch),
-                )
+            block = nn.Sequential(
+                nn.ConvTranspose2d(
+                    channels[n_blocks - i],
+                    channels[n_blocks - i],
+                    kernel_size=2,
+                    stride=2,
+                ),
+                ConvBlock(in_ch, out_ch),
+                (
+                    nn.Dropout2d(dropout) if i < n_blocks - 1 else nn.Identity()
+                ),  # No dropout on last layer
             )
+            self.decoder_blocks.append(block)
 
-        # Output layer
-        self.output = nn.Conv2d(channels[0], in_channels, kernel_size=1)
+        # Output layer with residual connection and proper initialization
+        self.output = nn.Sequential(
+            nn.Conv2d(channels[0], channels[0] // 2, kernel_size=3, padding=1),
+            nn.PReLU(),
+            nn.Conv2d(channels[0] // 2, in_channels, kernel_size=1),
+            nn.Tanh(),  # Ensure output is bounded to prevent explosion
+        )
 
         # Initialize weights properly to prevent vanishing outputs
         self._initialize_weights()
@@ -163,6 +176,7 @@ class SpectroUNet(nn.Module):
 
     def forward(self, x):
         # x shape: (B, C, H, W) where C is frequency bins
+        residual_input = x  # Store input for residual connection
 
         # Encoder with skip connections
         skip_connections = []
@@ -175,36 +189,47 @@ class SpectroUNet(nn.Module):
 
         # Decoder with skip connections
         for i, block in enumerate(self.decoder_blocks):
-            x = block[0](x)  # Transpose conv
-            skip = skip_connections[-(i + 1)]
+            # Transpose convolution
+            if len(block) >= 3:
+                x = block[0](x)  # Transpose conv
+                skip = skip_connections[-(i + 1)]
 
-            # Ensure spatial dimensions match before concatenation
-            if x.shape[2:] != skip.shape[2:]:
-                # Crop or pad to match skip connection size
-                diff_h = skip.shape[2] - x.shape[2]
-                diff_w = skip.shape[3] - x.shape[3]
+                # Ensure spatial dimensions match before concatenation
+                if x.shape[2:] != skip.shape[2:]:
+                    # Crop or pad to match skip connection size
+                    diff_h = skip.shape[2] - x.shape[2]
+                    diff_w = skip.shape[3] - x.shape[3]
 
-                if diff_h > 0 or diff_w > 0:
-                    # Pad if upsampled tensor is smaller
-                    pad_h = max(0, diff_h)
-                    pad_w = max(0, diff_w)
-                    x = F.pad(x, (0, pad_w, 0, pad_h))
-                elif diff_h < 0 or diff_w < 0:
-                    # Crop if upsampled tensor is larger
-                    x = x[:, :, : skip.shape[2], : skip.shape[3]]
+                    if diff_h > 0 or diff_w > 0:
+                        # Pad if upsampled tensor is smaller
+                        pad_h = max(0, diff_h)
+                        pad_w = max(0, diff_w)
+                        x = F.pad(x, (0, pad_w, 0, pad_h))
+                    elif diff_h < 0 or diff_w < 0:
+                        # Crop if upsampled tensor is larger
+                        x = x[:, :, : skip.shape[2], : skip.shape[3]]
 
-            x = torch.cat([x, skip], dim=1)
-            x = block[1](x)  # Conv block
+                x = torch.cat([x, skip], dim=1)
+                x = block[1](x)  # Conv block
+                if len(block) > 2:
+                    x = block[2](x)  # Dropout
+            else:
+                x = block(x)
 
-        # Output
-        x = self.output(x)
-        return x
+        # Output with residual connection
+        enhancement = self.output(x)
+
+        # Residual connection with gating to prevent over-correction
+        gate = torch.sigmoid(enhancement)  # Learn how much enhancement to apply
+        output = residual_input + gate * enhancement
+
+        return output
 
 
 class UnivNetWrapper(nn.Module):
     """
-    Simplified neural vocoder for audio enhancement
-    Operates directly on waveforms with residual connections
+    Lightweight neural vocoder for audio enhancement with stability improvements
+    Much simpler architecture to prevent training instability
     """
 
     def __init__(
@@ -219,67 +244,38 @@ class UnivNetWrapper(nn.Module):
         self.freeze_epochs = freeze_epochs
         self.sample_rate = sample_rate
 
-        # Multi-scale waveform enhancement network
-        # Uses dilated convolutions for different temporal receptive fields
-        self.enhancement_blocks = nn.ModuleList(
-            [
-                # Short-term features (transients)
-                nn.Sequential(
-                    nn.Conv1d(1, 32, kernel_size=7, padding=3, dilation=1),
-                    nn.PReLU(),
-                    nn.Conv1d(32, 32, kernel_size=7, padding=3, dilation=1),
-                    nn.PReLU(),
-                ),
-                # Medium-term features (harmonics)
-                nn.Sequential(
-                    nn.Conv1d(1, 32, kernel_size=15, padding=7, dilation=1),
-                    nn.PReLU(),
-                    nn.Conv1d(32, 32, kernel_size=15, padding=14, dilation=2),
-                    nn.PReLU(),
-                ),
-                # Long-term features (texture)
-                nn.Sequential(
-                    nn.Conv1d(1, 32, kernel_size=31, padding=15, dilation=1),
-                    nn.PReLU(),
-                    nn.Conv1d(32, 32, kernel_size=31, padding=60, dilation=4),
-                    nn.PReLU(),
-                ),
-            ]
+        # Simplified single-path enhancement with strong residual connections
+        self.enhancer = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=7, padding=3, dilation=1),
+            nn.BatchNorm1d(16),
+            nn.PReLU(),
+            nn.Dropout1d(0.1),
+            nn.Conv1d(16, 16, kernel_size=7, padding=3, dilation=1),
+            nn.BatchNorm1d(16),
+            nn.PReLU(),
+            nn.Dropout1d(0.1),
+            nn.Conv1d(16, 8, kernel_size=5, padding=2),
+            nn.BatchNorm1d(8),
+            nn.PReLU(),
+            nn.Conv1d(8, 1, kernel_size=3, padding=1),
+            nn.Tanh(),  # Bounded output to prevent explosion
         )
 
-        # Feature fusion and output
-        self.fusion = nn.Sequential(
-            nn.Conv1d(96, 64, kernel_size=7, padding=3),  # 32*3 = 96 input channels
-            nn.PReLU(),
-            nn.Conv1d(64, 32, kernel_size=5, padding=2),
-            nn.PReLU(),
-            nn.Conv1d(32, 1, kernel_size=3, padding=1),
-        )
-
-        # High-frequency enhancer for air and presence
-        self.hf_enhance = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.PReLU(),
-            nn.Conv1d(16, 16, kernel_size=3, padding=1),
-            nn.PReLU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-            nn.Tanh(),
-        )
-
-        # Initialize weights properly
+        # Initialize weights for stability
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize weights to prevent vanishing gradients"""
+        """Initialize weights for training stability"""
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                nn.init.xavier_uniform_(
+                    m.weight, gain=0.5
+                )  # Conservative initialization
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-
-        # Initialize final layer with small weights to start with identity-like behavior
-        if hasattr(self.fusion[-1], "weight"):
-            nn.init.xavier_uniform_(self.fusion[-1].weight, gain=0.1)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def freeze_parameters(self):
         """Freeze all parameters in the vocoder"""
@@ -293,7 +289,7 @@ class UnivNetWrapper(nn.Module):
 
     def forward(self, waveform):
         """
-        Enhance waveform using multi-scale processing
+        Enhance waveform with strong residual connections for stability
         Args:
             waveform: Input waveform tensor of shape (B, T) or (B, 1, T)
         Returns:
@@ -307,30 +303,16 @@ class UnivNetWrapper(nn.Module):
             x = waveform  # Already (B, 1, T)
             squeeze_output = False
 
-        # Store original for residual connection
+        # Store original for strong residual connection
         residual = x
 
-        # Multi-scale feature extraction
-        features = []
-        for block in self.enhancement_blocks:
-            feat = block(x)
-            features.append(feat)
+        # Apply enhancement with dropout during training
+        enhancement = self.enhancer(x)  # (B, 1, T)
 
-        # Concatenate multi-scale features
-        combined_features = torch.cat(features, dim=1)  # (B, 96, T)
-
-        # Feature fusion
-        enhanced = self.fusion(combined_features)  # (B, 1, T)
-
-        # High-frequency enhancement
-        hf_component = self.hf_enhance(x)
-
-        # Combine with residual connection and HF enhancement
-        # Use learnable mixing to prevent over-processing
-        output = residual + 0.3 * enhanced + 0.1 * hf_component
-
-        # Apply soft limiting to prevent clipping
-        output = torch.tanh(output * 0.95)
+        # Strong residual connection with conservative mixing
+        # Start with mostly input signal, gradually learn enhancements
+        alpha = 0.1  # Conservative enhancement mixing
+        output = (1 - alpha) * residual + alpha * enhancement
 
         # Remove channel dimension if input was 2D
         if squeeze_output:
@@ -477,9 +459,14 @@ class Concert2StudioModel(nn.Module):
         }
 
         # Training stability improvements
-        self.spectral_convergence_loss = SpectralConvergenceLoss()
         self.register_buffer("global_step", torch.tensor(0))
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
+
+        # Gradient clipping parameters
+        self.max_grad_norm = config["training"].get("max_grad_norm", 1.0)
+
+        # Apply spectral normalization to prevent gradient explosion
+        self._apply_spectral_norm()
 
     def forward(self, waveform, target_waveform=None):
         # Convert to spectrogram
@@ -544,12 +531,12 @@ class Concert2StudioModel(nn.Module):
         return final_waveform
 
     def calculate_losses(self, pred, target):
-        """Calculate combined loss with stability improvements"""
+        """Calculate combined loss with strong stability improvements for small datasets"""
         losses = {}
 
-        # L1 loss with gradient clipping protection
+        # L1 loss (primary reconstruction loss)
         l1_loss = self.l1_loss(pred, target)
-        losses["l1"] = torch.clamp(l1_loss, max=10.0)  # Prevent L1 explosion
+        losses["l1"] = torch.clamp(l1_loss, max=5.0)  # More conservative clamping
 
         # Add channel dimension for auraloss (expects 3D: batch, channels, time)
         if pred.dim() == 2:
@@ -559,57 +546,57 @@ class Concert2StudioModel(nn.Module):
             pred_3d = pred
             target_3d = target
 
-        # Multi-resolution STFT loss with stability check
+        # Multi-resolution STFT loss with conservative weighting
         try:
             stft_loss = self.multires_stft_loss(pred_3d, target_3d)
-            losses["multires_stft"] = torch.clamp(stft_loss, max=50.0)
+            losses["multires_stft"] = torch.clamp(stft_loss, max=20.0)
         except Exception as e:
             print(f"STFT loss computation failed: {e}")
             losses["multires_stft"] = torch.tensor(0.0, device=pred.device)
 
-        # VGGish perceptual loss with error handling
-        try:
-            vggish_loss = self.vggish_loss(pred, target)
-            losses["vggish"] = torch.clamp(vggish_loss, max=5.0)
-        except Exception as e:
-            print(f"VGGish loss computation failed: {e}")
-            losses["vggish"] = torch.tensor(0.0, device=pred.device)
-
-        # Spectral convergence loss for stability
+        # Simplified spectral loss instead of heavy VGGish
         pred_spec = self.stft(pred)
         target_spec = self.stft(target)
-        losses["spectral_convergence"] = self.spectral_convergence_loss(
-            pred_spec, target_spec
-        )
 
-        # Adaptive loss weighting based on training progress
-        self.global_step += 1
-        progress = min(
-            self.global_step.float() / 10000.0, 1.0
-        )  # Warm up over 10k steps
+        # Basic spectral magnitude loss
+        pred_mag = torch.abs(pred_spec)
+        target_mag = torch.abs(target_spec)
+        spectral_loss = F.l1_loss(pred_mag, target_mag)
+        losses["spectral"] = torch.clamp(spectral_loss, max=2.0)
 
-        # Start with reconstruction losses, gradually add perceptual losses
-        l1_weight = self.loss_weights["l1"]
-        stft_weight = self.loss_weights["multires_stft"] * progress
-        vggish_weight = self.loss_weights["vggish"] * (
-            progress**2
-        )  # Add perceptual loss slower
-
-        # Combined loss with balanced weighting
+        # Conservative loss weighting to prevent training instability
+        # Heavily favor L1 loss for small datasets
         total_loss = (
-            l1_weight * losses["l1"]
-            + stft_weight * losses["multires_stft"]
-            + vggish_weight * losses["vggish"]
-            + 0.1 * losses["spectral_convergence"]  # Stability term
+            0.7 * losses["l1"]  # Dominant L1 loss
+            + 0.2 * losses["multires_stft"]  # Reduced STFT weight
+            + 0.1 * losses["spectral"]  # Light spectral guidance
         )
 
-        # Numerical stability check
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            print("Warning: NaN/Inf detected in loss computation, using L1 loss only")
+        # Strict numerical stability check
+        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 100.0:
+            print("Warning: Unstable loss detected, falling back to L1 only")
             total_loss = losses["l1"]
 
         losses["total"] = total_loss
         return losses
+
+    def _apply_spectral_norm(self):
+        """Apply spectral normalization to key layers for gradient stability"""
+        # Apply spectral norm to U-Net output layers
+        for module in self.unet.modules():
+            if isinstance(module, nn.Conv2d) and module.kernel_size == (1, 1):
+                # Apply to 1x1 conv layers (typically output layers)
+                torch.nn.utils.spectral_norm(module)
+
+        # Apply spectral norm to vocoder if used
+        if self.use_vocoder and hasattr(self.vocoder, "enhancer"):
+            for module in self.vocoder.enhancer.modules():
+                if isinstance(module, nn.Conv1d) and module.kernel_size == (3,):
+                    torch.nn.utils.spectral_norm(module)
+
+    def clip_gradients(self):
+        """Clip gradients to prevent explosion"""
+        torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
 
 
 def count_parameters(model):
