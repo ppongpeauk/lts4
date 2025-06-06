@@ -137,6 +137,24 @@ class SpectroUNet(nn.Module):
         # Output layer
         self.output = nn.Conv2d(channels[0], in_channels, kernel_size=1)
 
+        # Initialize weights properly to prevent vanishing outputs
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize model weights to prevent vanishing outputs"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.ConvTranspose2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
         # x shape: (B, C, H, W) where C is frequency bins
 
@@ -238,14 +256,15 @@ class UnivNetWrapper(nn.Module):
             param.requires_grad = True
 
     def forward(self, spectrogram):
-        # Convert spectrogram to mel-spectrogram
-        mel = self.mel_spectrogram(spectrogram)
+        # For now, bypass the vocoder completely to debug the U-Net
+        # The vocoder might be causing the silence issue
 
-        # Generate waveform from mel-spectrogram
-        # mel shape: (B, n_mels, T)
-        waveform = self.generator(mel)
+        # Simply return the input spectrogram as a waveform for debugging
+        # This is a temporary bypass to isolate the U-Net performance
 
-        return waveform.squeeze(1)  # Remove channel dimension
+        # Convert 2D spectrogram back to waveform using ISTFT
+        # Note: This is a simplified approach for debugging
+        return spectrogram  # Pass through for now
 
 
 class MultiResSTFTLoss(nn.Module):
@@ -374,18 +393,12 @@ class Concert2StudioModel(nn.Module):
                 pad_length = waveform.shape[-1] - enhanced_waveform.shape[-1]
                 enhanced_waveform = F.pad(enhanced_waveform, (0, pad_length))
 
-        # Further enhance with vocoder
-        final_waveform = self.vocoder(enhanced_waveform)
+        # Temporarily bypass vocoder to debug U-Net training
+        # The vocoder might be causing the silence issue
+        final_waveform = enhanced_waveform
 
-        # Ensure final output length matches input length
-        if final_waveform.shape[-1] != waveform.shape[-1]:
-            if final_waveform.shape[-1] > waveform.shape[-1]:
-                # Trim if output is longer
-                final_waveform = final_waveform[..., : waveform.shape[-1]]
-            else:
-                # Pad if output is shorter
-                pad_length = waveform.shape[-1] - final_waveform.shape[-1]
-                final_waveform = F.pad(final_waveform, (0, pad_length))
+        # Ensure final output length matches input length (already done above)
+        # No additional processing needed since we're bypassing the vocoder
 
         if target_waveform is not None:
             # Calculate losses during training

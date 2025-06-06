@@ -39,7 +39,7 @@ model:
 
 # Training Configuration
 training:
-  batch_size: 64
+  batch_size: 8  # Reduced to avoid memory issues and training instability
   num_epochs: 100
   learning_rate: 2e-4
   weight_decay: 1e-3
@@ -51,9 +51,9 @@ training:
 
 # Loss Configuration
 loss:
-  l1_weight: 0.5
-  multires_stft_weight: 0.5
-  vggish_weight: 0.05
+  l1_weight: 1.0  # Increased for stronger reconstruction signal
+  multires_stft_weight: 1.0  # Increased for better spectral quality
+  vggish_weight: 0.1  # Increased perceptual loss weight
   adversarial_weight: 4e-4
 
   # Multi-resolution STFT scales
