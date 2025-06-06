@@ -245,54 +245,33 @@ class UnivNetWrapper(nn.Module):
         self.freeze_epochs = freeze_epochs
         self.sample_rate = sample_rate
 
-        # Multi-scale noise reduction with gated residual connections
-        self.enhancer = nn.ModuleDict(
-            {
-                # High-frequency noise reduction path
-                "hf_path": nn.Sequential(
-                    nn.Conv1d(1, 8, kernel_size=3, padding=1, dilation=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                    nn.Conv1d(8, 8, kernel_size=3, padding=1, dilation=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                ),
-                # Mid-frequency enhancement path
-                "mf_path": nn.Sequential(
-                    nn.Conv1d(1, 8, kernel_size=5, padding=2, dilation=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                    nn.Conv1d(8, 8, kernel_size=5, padding=2, dilation=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                ),
-                # Low-frequency preservation path
-                "lf_path": nn.Sequential(
-                    nn.Conv1d(1, 8, kernel_size=7, padding=3, dilation=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                    nn.Conv1d(8, 8, kernel_size=7, padding=3, dilation=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                ),
-                # Fusion and output
-                "fusion": nn.Sequential(
-                    nn.Conv1d(24, 12, kernel_size=3, padding=1),
-                    nn.BatchNorm1d(12),
-                    nn.PReLU(),
-                    nn.Dropout1d(0.1),
-                    nn.Conv1d(12, 1, kernel_size=1),
-                    nn.Tanh(),  # Bounded output
-                ),
-                # Gating mechanism for adaptive mixing
-                "gate": nn.Sequential(
-                    nn.Conv1d(1, 8, kernel_size=3, padding=1),
-                    nn.BatchNorm1d(8),
-                    nn.PReLU(),
-                    nn.Conv1d(8, 1, kernel_size=1),
-                    nn.Sigmoid(),  # 0-1 gating
-                ),
-            }
+        # Simplified noise reduction with stable architecture
+        self.enhancer = nn.Sequential(
+            # First noise reduction block
+            nn.Conv1d(1, 16, kernel_size=7, padding=3),
+            nn.BatchNorm1d(16),
+            nn.PReLU(),
+            nn.Dropout1d(0.1),
+            # Second noise reduction block
+            nn.Conv1d(16, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.PReLU(),
+            nn.Dropout1d(0.1),
+            # Final output with noise suppression
+            nn.Conv1d(16, 8, kernel_size=3, padding=1),
+            nn.BatchNorm1d(8),
+            nn.PReLU(),
+            nn.Conv1d(8, 1, kernel_size=1),
+            nn.Tanh(),  # Bounded output to prevent artifacts
+        )
+
+        # Separate gating network for adaptive enhancement
+        self.gate_net = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=3, padding=1),
+            nn.BatchNorm1d(8),
+            nn.PReLU(),
+            nn.Conv1d(8, 1, kernel_size=1),
+            nn.Sigmoid(),  # 0-1 gate for mixing
         )
 
         # Initialize weights for stability
@@ -340,21 +319,11 @@ class UnivNetWrapper(nn.Module):
         # Store original for residual connection
         residual = x
 
-        # Multi-scale processing for different frequency ranges
-        hf_features = self.enhancer["hf_path"](x)  # High-frequency noise reduction
-        mf_features = self.enhancer["mf_path"](x)  # Mid-frequency enhancement
-        lf_features = self.enhancer["lf_path"](x)  # Low-frequency preservation
-
-        # Concatenate multi-scale features (ensure contiguous memory)
-        combined_features = torch.cat(
-            [hf_features, mf_features, lf_features], dim=1
-        ).contiguous()
-
-        # Fuse features into enhancement signal
-        enhancement = self.enhancer["fusion"](combined_features)
+        # Apply noise reduction enhancement
+        enhancement = self.enhancer(x)
 
         # Adaptive gating - learn how much enhancement to apply
-        gate = self.enhancer["gate"](x)
+        gate = self.gate_net(x)
 
         # Apply gated enhancement with residual connection
         # Gate determines mix between original and enhanced signal
