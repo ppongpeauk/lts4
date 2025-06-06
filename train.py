@@ -87,9 +87,12 @@ class Trainer:
         # Initialize optimizer and scheduler
         self.optimizer = AdamW(
             self.model.parameters(),
-            lr=config["training"]["learning_rate"],
-            betas=(config["training"]["beta1"], config["training"]["beta2"]),
-            weight_decay=config["training"]["weight_decay"],
+            lr=float(config["training"]["learning_rate"]),
+            betas=(
+                float(config["training"]["beta1"]),
+                float(config["training"]["beta2"]),
+            ),
+            weight_decay=float(config["training"]["weight_decay"]),
         )
 
         # Create learning rate scheduler
@@ -97,7 +100,7 @@ class Trainer:
 
         # Initialize early stopping
         self.early_stopping = EarlyStopping(
-            patience=config["training"]["early_stopping_patience"], mode="min"
+            patience=int(config["training"]["early_stopping_patience"]), mode="min"
         )
 
         # Training state
@@ -129,8 +132,8 @@ class Trainer:
 
     def create_scheduler(self):
         """Create learning rate scheduler with warmup"""
-        warmup_steps = self.config["training"]["warmup_steps"]
-        total_steps = self.config["training"]["num_epochs"] * 1000  # Estimate
+        warmup_steps = int(self.config["training"]["warmup_steps"])
+        total_steps = int(self.config["training"]["num_epochs"]) * 1000  # Estimate
 
         # Linear warmup
         warmup_scheduler = LinearLR(
