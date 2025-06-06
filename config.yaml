@@ -24,10 +24,10 @@ model:
   # Spectrogram U-Net (optimized for small dataset + stereo)
   unet:
     in_channels: 513  # Frequency bins for 1024 FFT (1024//2 + 1)
-    base_channels: 12  # Reduced capacity to prevent overfitting
-    max_channels: 64   # Much smaller capacity for tiny dataset
-    n_blocks: 2        # Fewer blocks to reduce complexity
-    dilations: [1, 2]  # Simplified receptive fields
+    base_channels: 16  # Reduced capacity to prevent overfitting
+    max_channels: 128   # Much smaller capacity for tiny dataset
+    n_blocks: 3        # Fewer blocks to reduce complexity
+    dilations: [1, 2, 4]  # Simplified receptive fields
     use_attention: false  # Disable attention to reduce overfitting
     attention_heads: 2
     dropout: 0.5  # Aggressive dropout for regularization
